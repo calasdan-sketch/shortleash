@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "shortleash"
+# Single source of truth: shortleash/__init__.py defines __version__.
+dynamic = ["version"]
+description = "Circuit breaker for AI coding-agent runs."
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.setuptools.dynamic]
+version = {attr = "shortleash.__version__"}
+[project.scripts]
+shortleash = "shortleash.cli:main"
