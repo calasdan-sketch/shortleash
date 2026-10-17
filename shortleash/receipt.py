@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timezone
 
@@ -114,6 +115,8 @@ def build_receipt(
     agent_error: bool = False,
     agent_error_text: str = "",
     hint: str | None = None,
+    child_returncode: int | None = None,
+    anomaly_armed: dict | None = None,
 ) -> dict:
     return {
         "tool": "shortleash",
@@ -143,6 +146,10 @@ def build_receipt(
         "num_turns": num_turns,
         "subagent_spawns": spawns,
         "exit_code": exit_code,
+        # What the child itself returned, untouched: a negative "killed by
+        # signal N" on POSIX, a 32-bit status on Windows; None when the
+        # tree would not die. exit_code above is what the leash exits with.
+        "child_returncode": child_returncode,
         "model": model,
         "session_id": session_id,
         # Trust boundary, made explicit: which caps actually held.
@@ -150,6 +157,10 @@ def build_receipt(
         "usage_events": usage_events,
         "enforced": list(enforced or []),
         "not_enforced": list(not_enforced or []),
+        # --anomaly: {"armed", "runs", "min_runs", "multiplier"}, or None
+        # when anomaly mode was not requested. Un-armed means no anomaly
+        # cap held (it is then in neither enforced nor not_enforced).
+        "anomaly": anomaly_armed,
         "pricing": pricing,
         "warnings": list(warnings or []),
         # The agent's own verdict: a stream-json `result` with is_error
@@ -222,12 +233,31 @@ def format_human(receipt: dict) -> str:
     for w in receipt.get("warnings") or []:
         lines.append(f"  warning:   {w}")
     baseline = receipt.get("baseline")
+    anomaly = receipt.get("anomaly")
     if baseline:
         lines.append(f"  baseline:  typical ${baseline['median_cost']:.4f} / "
                      f"{baseline['median_tokens']:,} tokens "
                      f"({baseline['runs']} past runs)")
+    elif anomaly and not anomaly.get("armed"):
+        lines.append(f"  anomaly:   not armed ({anomaly.get('runs', 0)} of "
+                     f"{anomaly.get('min_runs', '?')} runs) — nothing was "
+                     f"enforced by it")
     lines.append("──────────────────────────────────────────────────")
     return "\n".join(lines)
+
+
+def prepare_receipt_path(path: str) -> None:
+    """Make sure a receipt can be written to ``path`` before the run
+    starts: create the directory and test-open the file (a pre-existing
+    file is left as it is; one we created for the test is removed again).
+    Raises OSError with the reason when it cannot be done."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    existed = os.path.exists(path)
+    with open(path, "a", encoding="utf-8"):
+        pass
+    if not existed:
+        os.remove(path)
 
 
 def write_receipt(receipt: dict, path: str) -> None:

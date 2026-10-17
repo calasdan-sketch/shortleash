@@ -73,7 +73,31 @@ _MESSAGE_WINDOW = 256
 
 
 class _Terminated(BaseException):
-    """Raised in the main thread by the SIGTERM handler to unwind wait()."""
+    """Raised in the main thread by the SIGTERM/SIGBREAK handler to unwind
+    the current wait. Carries the signal's name and the receipt label."""
+
+    def __init__(self, which: str = "SIGTERM",
+                 label: str = "terminated (SIGTERM)"):
+        super().__init__(which)
+        self.which = which
+        self.label = label
+
+
+def child_exit_code(returncode: int) -> int:
+    """The exit code the leash reports for a child that exited on its own.
+
+    POSIX: a negative returncode means "killed by signal N"; a shell says
+    128+N, so do we. Windows has no signals: its returncode is the
+    process's own 32-bit status (an NTSTATUS such as 0xC0000005 for an
+    access violation), so 128-N would be nonsense there — it is passed
+    through, clamped to 0-255 like a shell's $? (the raw value is kept in
+    the receipt as child_returncode).
+    """
+    if returncode < 0:
+        if not proctree.is_windows():
+            return 128 - returncode
+        returncode &= 0xFFFFFFFF  # a signed view of the 32-bit status
+    return returncode if returncode <= 255 else 255
 
 
 def _child_stderr():
@@ -134,6 +158,7 @@ class Guard:
         self.min_history = min_history
         self.redact_prompt = redact_prompt
         self._baseline: dict | None = None
+        self._anomaly_armed: dict | None = None  # receipt "anomaly" field
         self.agent = ""
 
         self._lock = threading.Lock()
@@ -153,7 +178,9 @@ class Guard:
         self.breached = False
         self.breach_reason: str | None = None
         self.interrupted_by: str | None = None  # "SIGINT" / "SIGTERM"
-        self._in_wait = False
+        self._in_wait = False     # a signal may unwind the current wait
+        self._finishing = False   # receipt time: a signal only kills, never unwinds
+        self._pending_signal: tuple[str, str] | None = None  # recorded, not raised
         self.escaped = False
         self.echo = True
         self.warnings: list[str] = []
@@ -320,12 +347,15 @@ class Guard:
         for line in self.proc.stdout:
             self._echo_line(line)
             try:
-                # FAIL-CLOSED trust boundary: the child is untrusted. If a
-                # telemetry line cannot be parsed cleanly (bad JSON, or a
-                # numeric field that isn't numeric — e.g. "input_tokens":
-                # "abc" raising ValueError), the run is tripped immediately.
-                # Letting the exception escape would kill this thread and
-                # leave the supervisor blocked on proc.wait() forever.
+                # Trust boundary: the child is untrusted. Lines that are not
+                # JSON objects (warnings, entrypoint chatter, plain text) are
+                # NOT telemetry and are ignored — events.parse_line returns
+                # None for them. A line that IS a telemetry event but whose
+                # fields are malformed (a numeric field that isn't numeric,
+                # e.g. "input_tokens": "abc" raising ValueError) fails
+                # closed: the run is tripped immediately. Letting the
+                # exception escape would kill this thread and leave the
+                # supervisor blocked on proc.wait() forever.
                 obs = events.parse_line(line)
                 if obs is not None:
                     obs = self._handle_obs(obs)
@@ -382,19 +412,46 @@ class Guard:
 
     # -- escaped children ---------------------------------------------
 
+    def _join_monitor(self, monitor: threading.Thread, timeout: float) -> bool:
+        """Wait up to ``timeout`` for the monitor thread, in 0.5 s slices.
+        Returns True when the thread has ended.
+
+        A signal that arrives meanwhile is only RECORDED by the handler
+        (_pending_signal) and raised here, between slices: a handler that
+        raises inside Thread.join() trips a CPython 3.11 bug
+        (_wait_for_tstate_lock releases the still-running thread's state
+        lock and marks it stopped, so is_alive() lies — closing the pipe
+        then deadlocks against the reader). The slices also keep Windows,
+        whose waits cannot be interrupted, responsive."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while monitor.is_alive():
+            pending = self._pending_signal
+            if pending is not None and not self._finishing:
+                self._pending_signal = None
+                raise _Terminated(*pending)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            monitor.join(timeout=min(0.5, left))
+        return not monitor.is_alive()
+
     def _reap_stragglers(self, monitor: threading.Thread) -> None:
         """Called after the child exited. If the monitor is still blocked,
         a grandchild inherited our stdout pipe and is still running: kill
         the child's process group and give the pipe one more grace period
-        to close. Never block on it beyond that."""
-        monitor.join(timeout=self.grace_period)
-        if not monitor.is_alive():
+        to close. Never block on it beyond that. A signal to the leash in
+        this window unwinds to run(), which kills what is left at once."""
+        if self._join_monitor(monitor, self.grace_period):
             return
         self.escaped = True
-        killed = proctree.kill_tree(self.proc, grace=self.grace_period,
-                                    child_exited=True, job=self.job)
-        monitor.join(timeout=self.grace_period)
-        if monitor.is_alive():
+        self._in_wait = True  # the kill's grace sleep may be unwound
+        try:
+            killed = proctree.kill_tree(self.proc, grace=self.grace_period,
+                                        child_exited=True, job=self.job)
+        finally:
+            self._in_wait = False
+        still_open = not self._join_monitor(monitor, self.grace_period)
+        if still_open:
             self.warnings.append(
                 "escaped child process(es) still hold the output pipe open "
                 "after the kill (detached from the process group?) — "
@@ -410,32 +467,71 @@ class Guard:
 
     # -- signals -------------------------------------------------------
 
-    def _on_sigterm(self, signum, frame):
-        if self._in_wait:
-            raise _Terminated()
-        # Not inside the wait loop (launching, or already writing the
-        # receipt): kill the tree now and let run() finish normally.
-        self._interrupt("SIGTERM", "terminated (SIGTERM)")
-
-    def _install_sigterm(self):
-        """Route SIGTERM through the same path as Ctrl-C. Only the main
-        thread may set handlers; elsewhere (Guard.run in a worker thread)
-        the default action stands. Returns the previous handler or None."""
-        if threading.current_thread() is not threading.main_thread():
-            return None
+    @staticmethod
+    def _signal_label(signum) -> tuple[str, str]:
+        """("SIGINT", "interrupted (Ctrl-C)") or ("SIGTERM"/"SIGBREAK",
+        "terminated (SIGTERM)")."""
+        if signum == getattr(signal, "SIGINT", None):
+            return "SIGINT", "interrupted (Ctrl-C)"
         try:
-            return signal.signal(signal.SIGTERM, self._on_sigterm)
-        except (ValueError, OSError, AttributeError):
-            return None
+            name = signal.Signals(signum).name
+        except (ValueError, AttributeError):
+            name = "SIGTERM"
+        return name, f"terminated ({name})"
+
+    def _on_signal(self, signum, frame):
+        """Ctrl-C (SIGINT), SIGTERM and, on Windows, Ctrl-Break to the leash.
+
+        Inside the child wait (or a kill's grace sleep) the signal unwinds
+        that wait so run() handles it in one place: Ctrl-C as
+        KeyboardInterrupt, like Python's default handler would. Past the
+        point of no return — the receipt is being built and written, a
+        matter of milliseconds — it only kills whatever is left, without
+        grace, and lets the write finish: the receipt is the whole point.
+        """
+        which, label = self._signal_label(signum)
+        if self._finishing:
+            self.grace_period = 0.0
+            self._kill_tree()
+            return
+        if self._in_wait:
+            if which == "SIGINT":
+                raise KeyboardInterrupt()
+            raise _Terminated(which, label)
+        # Anywhere else (a Thread.join in the straggler window, the gap
+        # between launch and the first wait): never raise from here — see
+        # _join_monitor — just record it; the waits poll for it.
+        if self._pending_signal is None:
+            self._pending_signal = (which, label)
+
+    def _install_handlers(self) -> list:
+        """Route SIGINT, SIGTERM (and SIGBREAK where it exists) through
+        _on_signal. Only the main thread may set handlers; elsewhere
+        (Guard.run in a worker thread) the default actions stand. A signal
+        the parent set to be ignored stays ignored. Returns what to pass to
+        _restore_handlers()."""
+        previous = []
+        if threading.current_thread() is not threading.main_thread():
+            return previous
+        for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            try:
+                if signal.getsignal(signum) is signal.SIG_IGN:
+                    continue
+                previous.append((signum, signal.signal(signum, self._on_signal)))
+            except (ValueError, OSError, AttributeError):
+                pass
+        return previous
 
     @staticmethod
-    def _restore_sigterm(previous) -> None:
-        if previous is None:
-            return
-        try:
-            signal.signal(signal.SIGTERM, previous)
-        except (ValueError, OSError, AttributeError):
-            pass
+    def _restore_handlers(previous: list) -> None:
+        for signum, handler in previous:
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError, AttributeError):
+                pass
 
     def _wait_child(self) -> int | None:
         """Wait for the child, handling Ctrl-C and SIGTERM to the leash.
@@ -454,6 +550,11 @@ class Guard:
                     "the agent process did not exit after the kill; the "
                     "leash stopped waiting for it")
                 return None
+            pending, self._pending_signal = self._pending_signal, None
+            if pending is not None:  # arrived between launch and this wait
+                self._interrupt(*pending)
+                if deadline is None:
+                    deadline = time.monotonic() + self.grace_period + 10.0
             self._in_wait = True
             try:
                 return proc.wait(timeout=0.5)
@@ -461,8 +562,8 @@ class Guard:
                 continue
             except KeyboardInterrupt:
                 self._interrupt("SIGINT", "interrupted (Ctrl-C)")
-            except _Terminated:
-                self._interrupt("SIGTERM", "terminated (SIGTERM)")
+            except _Terminated as t:
+                self._interrupt(t.which, t.label)
             finally:
                 self._in_wait = False
             if deadline is None:
@@ -480,6 +581,53 @@ class Guard:
             self.grace_period = 0.0
             self._kill_tree()
 
+    def _late_interrupt(self, which: str, label: str,
+                        monitor: threading.Thread) -> None:
+        """The leash was signalled outside the child wait — typically in
+        the straggler window: the child has exited but something it spawned
+        still holds our stdout pipe, and we were waiting for it (up to two
+        grace periods). No more grace: whatever is left of the tree is
+        killed outright, and the receipt still gets written (130 / 143).
+        (This used to be a KeyboardInterrupt traceback out of monitor.join,
+        or a silent death from SIGTERM: no receipt, stragglers running.)"""
+        # From here on a further signal only kills, never unwinds: the
+        # receipt is about to be written.
+        self._finishing = True
+        if self.interrupted_by is None:
+            self.interrupted_by = which
+        child_exited = self.proc is not None and self.proc.poll() is not None
+        with self._lock:
+            if not self.breached:
+                self.breached = True
+                if child_exited:
+                    self.breach_reason = (
+                        f"{label}: the leash was signalled after the command "
+                        f"exited and killed the process(es) it left running")
+                else:
+                    self.breach_reason = (
+                        f"{label}: the leash was signalled and killed the "
+                        f"agent's process tree")
+        self.grace_period = 0.0
+        if monitor.is_alive():
+            self.escaped = self.escaped or child_exited
+        self._kill_tree()
+        if self.proc is not None and not child_exited:
+            try:
+                self.proc.wait(timeout=5.0)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        # The kill closes the pipe unless a grandchild detached into its
+        # own session; give the monitor a moment, never more.
+        if not self._join_monitor(monitor, 1.0):
+            self.warnings.append(
+                "escaped child process(es) still hold the output pipe open "
+                "after the kill (detached from the process group?) — "
+                "the leash stopped waiting for them")
+        elif self.escaped:
+            self.warnings.append(
+                "the command left child process(es) running after it "
+                "exited; they were killed with the process tree")
+
     # -- main ---------------------------------------------------------
 
     def run(self, argv: list[str]) -> int:
@@ -492,6 +640,20 @@ class Guard:
                 self.agent, profile=self.profile,
                 path=self.history_path, min_runs=self.min_history,
                 warnings=self.warnings)
+            runs = (self._baseline["runs"] if self._baseline else
+                    history_mod.count_runs(self.agent, profile=self.profile,
+                                           path=self.history_path))
+            self._anomaly_armed = {
+                "armed": bool(self._baseline), "runs": runs,
+                "min_runs": self.min_history, "multiplier": self.anomaly}
+            if not self._baseline:
+                # Say so up front: an un-armed anomaly cap enforces
+                # nothing, and the receipt must not imply otherwise.
+                self.warnings.append(
+                    f"anomaly mode not armed ({runs} of {self.min_history} "
+                    f"past runs recorded for "
+                    f"{self.profile or self.agent or 'this agent'}) — only "
+                    f"the static caps apply to this run")
         self.proc = None
         self.job = None
         # Resolve the executable ourselves (PATHEXT shims on Windows) and
@@ -502,6 +664,18 @@ class Guard:
             sys.stderr.write(f"shortleash: error: {e}\n")
             sys.stderr.flush()
             return 2
+        # The receipt is the whole point of the run: make sure it CAN be
+        # written before anything is spent, instead of a FileNotFoundError
+        # traceback after the agent finished.
+        if self.receipt_path:
+            try:
+                receipt_mod.prepare_receipt_path(self.receipt_path)
+            except OSError as e:
+                sys.stderr.write(
+                    f"shortleash: error: cannot write the receipt to "
+                    f"{self.receipt_path}: {e.strerror or e}\n")
+                sys.stderr.flush()
+                return 2
         try:
             self.proc = subprocess.Popen(
                 cmd,
@@ -530,12 +704,30 @@ class Guard:
         watchdog = threading.Thread(target=self._watchdog, daemon=True)
         watchdog.start()
 
-        previous_term = self._install_sigterm()
+        # The handlers stay installed until the receipt is written and the
+        # run recorded: a signal in the straggler window (child gone, a
+        # grandchild still holding the pipe) used to find no handler
+        # (SIGTERM: silent death) or Python's default one (Ctrl-C:
+        # traceback out of monitor.join) — no receipt, stragglers running.
+        previous = self._install_handlers()
         try:
-            exit_code = self._wait_child()
+            try:
+                exit_code = self._wait_child()
+                self._reap_stragglers(monitor)
+            except (KeyboardInterrupt, _Terminated) as e:
+                which, label = ((e.which, e.label) if isinstance(e, _Terminated)
+                                else ("SIGINT", "interrupted (Ctrl-C)"))
+                self._late_interrupt(which, label, monitor)
+                exit_code = self.proc.poll()
+            self._finishing = True
+            return self._finish(argv, wall_start, exit_code, monitor)
         finally:
-            self._restore_sigterm(previous_term)
-        self._reap_stragglers(monitor)
+            self._restore_handlers(previous)
+
+    def _finish(self, argv: list[str], wall_start: float,
+                exit_code: int | None, monitor: threading.Thread) -> int:
+        """Close up, build and write the receipt, record the run, print the
+        summary. Runs with every signal reduced to "kill what is left"."""
         if not monitor.is_alive():
             # Only close the pipe once the reader is done: closing a
             # buffered reader while another thread is blocked in read()
@@ -556,17 +748,16 @@ class Guard:
             requested if telemetry else [])
         not_enforced = [] if telemetry else requested
 
+        child_returncode = exit_code
         if exit_code is None:
             exit_code = BREACH_EXIT_CODE  # the tree would not die (warned)
-        elif exit_code < 0:
-            # POSIX: killed by signal N (outside a breach) -> 128+N, as a
-            # shell would report it, instead of a negative number.
-            exit_code = 128 - exit_code
+        else:
+            exit_code = child_exit_code(exit_code)
         hint = None
         if self.breached:
             if self.interrupted_by == "SIGINT":
                 exit_code = INTERRUPTED_EXIT_CODE
-            elif self.interrupted_by == "SIGTERM":
+            elif self.interrupted_by is not None:  # SIGTERM (SIGBREAK)
                 exit_code = TERMINATED_EXIT_CODE
             else:
                 exit_code = BREACH_EXIT_CODE
@@ -614,9 +805,25 @@ class Guard:
             agent_error=self.agent_error,
             agent_error_text=self.agent_error_text,
             hint=hint,
+            child_returncode=child_returncode,
+            anomaly_armed=self._anomaly_armed,
         )
+        show = not self.quiet
         if self.receipt_path:
-            receipt_mod.write_receipt(rec, self.receipt_path)
+            try:
+                receipt_mod.write_receipt(rec, self.receipt_path)
+            except OSError as e:
+                # The directory was checked before launch, but the disk can
+                # still say no (full, removed, permissions changed): never
+                # a traceback after a run that already spent money — warn,
+                # and print the summary even under --quiet so nothing is
+                # lost.
+                note = (f"receipt could not be written to {self.receipt_path}: "
+                        f"{e.strerror or e}")
+                self.warnings.append(note)
+                rec["warnings"].append(note)
+                sys.stderr.write(f"shortleash: warning: {note}\n")
+                show = True
         # Learn from every run that produced telemetry (breached runs are
         # excluded from baselines; telemetry-less runs say nothing about
         # what a normal run costs, so they are not recorded at all).
@@ -625,7 +832,7 @@ class Guard:
                 history_mod.record(rec, self.history_path)
             except OSError:
                 pass
-        if not self.quiet:
+        if show:
             sys.stderr.write(receipt_mod.format_human(rec) + "\n")
             sys.stderr.flush()
         return exit_code

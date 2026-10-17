@@ -13,6 +13,7 @@ Subcommands:
 """
 
 import argparse
+import errno
 import atexit
 import os
 import sys
@@ -237,15 +238,66 @@ def _caps_banner(args) -> str:
     return " ".join(caps) if caps else "no caps set (nothing will be enforced)"
 
 
+# Tests patch this to exercise the Windows branch on any OS.
+_WINDOWS = os.name == "nt"
+
+
+def _pipe_gone(exc: BaseException) -> bool:
+    """Did the reader of our stdout go away?
+
+    POSIX raises BrokenPipeError (EPIPE). Windows reports the same thing as
+    a plain OSError with errno EINVAL and no file name (measured on Windows
+    11 / Python 3.11: errno 22, winerror None), raised by the FLUSH rather
+    than by the print, and it fails a second time at interpreter exit
+    (status 120) unless fd 1 is pointed at the null device first."""
+    if isinstance(exc, BrokenPipeError):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    if exc.errno == errno.EPIPE:
+        return True
+    return (_WINDOWS and exc.errno == errno.EINVAL
+            and getattr(exc, "filename", None) is None)
+
+
+def _stdout_gone() -> None:
+    """The reader of our stdout went away (`shortleash cache guide | head`):
+    nothing left to say, so say it quietly. Python flushes stdout once more
+    at exit, which would raise the same BrokenPipeError again — point the
+    descriptor at the null device first."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except OSError:  # no real descriptor (captured stdout): nothing to do
+        pass
+
+
+def _print_command(fn, args) -> int:
+    """Run a subcommand that only prints (cache, fleet): a closed pipe is
+    exit 0 and silence, never a traceback. (`run` is not routed through
+    here: the leash handles its own stdout, and its exit code is the
+    verdict on the agent run — it must not be rewritten to 0.)"""
+    try:
+        rc = fn(args)
+        if sys.stdout is not None:
+            sys.stdout.flush()  # a closed pipe surfaces here, not at exit
+        return rc
+    except OSError as e:
+        if not _pipe_gone(e):
+            raise
+        _stdout_gone()
+        return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _harden_streams()
     parser = _build_parser()
     args = parser.parse_args(argv)
 
     if args.cmd == "cache":
-        return _cmd_cache(args)
+        return _print_command(_cmd_cache, args)
     if args.cmd == "fleet":
-        return _cmd_fleet(args)
+        return _print_command(_cmd_fleet, args)
     if args.cmd == "run":
         # Guardrail caps must be non-negative; a negative cap would either
         # trip every run instantly or (worse) disable the check silently.

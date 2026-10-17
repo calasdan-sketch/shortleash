@@ -44,7 +44,16 @@ When wrapping `claude`, `--output-format stream-json --verbose` are added
 automatically (the guard needs the telemetry stream). The agent's stdout
 passes through untouched, so you still watch it work — and if whatever is
 reading it goes away (`shortleash run … | head -1`), the echo stops but the
-caps keep being checked; the receipt notes it.
+caps keep being checked; the receipt notes it. Non-JSON lines on that
+stdout (warnings, entrypoint chatter) are not telemetry and are ignored; a
+telemetry event whose fields are malformed (`"input_tokens": "abc"`) trips
+the run — the guard fails closed rather than guess.
+
+`--receipt path.json` creates a missing directory, and a path that cannot
+be written to at all is refused *before* the agent starts (exit `2`) — not
+discovered after the money was spent. Should the write still fail at the
+end (disk full), the receipt summary is printed on stderr instead, with a
+warning, even under `--quiet`.
 
 ### Stopping the leash (Ctrl-C, SIGTERM)
 
@@ -53,7 +62,13 @@ The agent runs in its own process group, so a Ctrl-C in your terminal (or a
 the agent's whole process tree, writes the receipt (`STOPPED: interrupted
 (Ctrl-C)` / `terminated (SIGTERM)`) and exits `130` / `143` — it never dies
 with a traceback leaving the agent running. A second Ctrl-C during the
-grace period force-kills at once.
+grace period force-kills at once. This holds at every point of the run,
+including the window after the agent itself has exited while the leash
+waits for stray processes it left behind (see *Killing the tree*): a signal
+there kills them at once, with no grace, and the receipt says `STOPPED:
+interrupted (Ctrl-C): the leash was signalled after the command exited and
+killed the process(es) it left running`. On Windows, Ctrl-Break is handled
+like SIGTERM.
 
 ### Anomaly mode (`--anomaly`, opt-in)
 
@@ -80,7 +95,12 @@ why anomaly mode is off unless you ask for it, and why the STOPPED line
 tells you the way out: run the task once without `--anomaly` (it is then
 recorded and the median moves), or give it its own baseline with
 `--profile big-refactor`. Tune with `--anomaly 5.0` and `--min-history 10`.
-`--no-anomaly` is still accepted (it is the default).
+`--no-anomaly` is still accepted (it is the default). Until the history is
+long enough, anomaly mode is **not armed** and enforces nothing: the
+receipt says so (`anomaly:   not armed (2 of 5 runs) — nothing was enforced
+by it`, a `warning:` line, and `"anomaly": {"armed": false, "runs": 2,
+"min_runs": 5, …}` in the JSON) and never lists `anomaly` under
+`enforced`.
 
 ### Fleet mode (`--fleet`)
 
@@ -130,11 +150,11 @@ design; the receipt warns about it instead of waiting forever.
 |---|---|
 | `124` | a cap tripped and the tree was killed (mirrors `timeout(1)`) |
 | `125` | a budget/token/spawn/anomaly cap was requested but the child produced **no usage telemetry** — the cap could not have been enforced (see *Trust boundary*) |
-| `130` / `143` | the leash itself got Ctrl-C / SIGTERM; tree killed, receipt written |
+| `130` / `143` | the leash itself got Ctrl-C / SIGTERM (Ctrl-Break on Windows) — at any point, the wait for stray children after the agent exited included; tree killed, receipt written |
 | `1` | the process exited 0 but its final stream-json `result` said `is_error: true` (`FAILED:` in the receipt, e.g. "Not logged in") |
-| `128+N` | the child was killed by signal N outside any breach (what a shell would report) |
-| `2` | usage error, command not found, unsafe `.cmd` launch refused |
-| other | the child's own exit code |
+| `128+N` | POSIX: the child was killed by signal N outside any breach (what a shell would report) |
+| `2` | usage error, command not found, unsafe `.cmd` launch refused, receipt path not writable |
+| other | the child's own exit code (on Windows its 32-bit status, clamped to 0–255; the raw value is `child_returncode` in the receipt) |
 
 ## The receipt
 
@@ -154,9 +174,12 @@ Every run ends with a receipt on stderr and optionally as JSON
 Mid-run cost is estimated from a fallback pricing table (clearly marked);
 the final receipt prefers the agent-reported `total_cost_usd` when the run
 completes. The receipt JSON also carries `telemetry_seen`, `usage_events`,
-`enforced` / `not_enforced` (which caps actually held), `pricing`
-(`as_of`, `source`), `agent_error` (the `is_error` verdict), `hint` and
-`warnings` (stray child processes, a closed stdout, corrupt history lines).
+`enforced` / `not_enforced` (which caps actually held), `anomaly` (whether
+anomaly mode was armed, and on how many runs), `pricing` (`as_of`,
+`source`), `agent_error` (the `is_error` verdict), `child_returncode` (what
+the child itself returned, untouched), `hint` and `warnings` (stray child
+processes, a closed stdout, corrupt history lines, an un-armed anomaly cap,
+a receipt that could not be written).
 
 ### What the receipt stores about your command
 

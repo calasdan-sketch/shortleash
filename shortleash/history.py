@@ -73,17 +73,12 @@ def _parse_entry(line: str) -> tuple[str, float, int, bool] | None:
     return _key(e), cost, tokens, bool(e.get("breached"))
 
 
-def baseline(agent: str, profile: str = "",
-             path: str | None = None,
-             min_runs: int = MIN_HISTORY,
-             warnings: list[str] | None = None) -> dict | None:
-    """Return {median_cost, median_tokens, runs} or None if not enough
-    history. Breached runs are excluded -- they were, by definition,
-    not normal. Corrupt lines are skipped; a note is appended to
-    ``warnings`` (when given) saying how many."""
+def _runs(agent: str, profile: str, path: str | None,
+          warnings: list[str] | None) -> tuple[list[float], list[int]]:
+    """(costs, tokens) of the non-breached past runs for agent/profile.
+    Corrupt lines are skipped; a note is appended to ``warnings`` (when
+    given) saying how many. A missing or unreadable file is no history."""
     path = path or default_history_path()
-    if not os.path.isfile(path):
-        return None
     want = profile or agent
     costs: list[float] = []
     tokens: list[int] = []
@@ -104,10 +99,29 @@ def baseline(agent: str, profile: str = "",
                 costs.append(cost)
                 tokens.append(toks)
     except OSError:
-        return None
+        return [], []
     if skipped and warnings is not None:
         warnings.append(
             f"history: skipped {skipped} corrupt line(s) in {path}")
+    return costs, tokens
+
+
+def count_runs(agent: str, profile: str = "",
+               path: str | None = None) -> int:
+    """How many non-breached past runs the baseline for agent/profile
+    would be built from (so a receipt can say "not armed (2 of 5 runs)")."""
+    return len(_runs(agent, profile, path, None)[0])
+
+
+def baseline(agent: str, profile: str = "",
+             path: str | None = None,
+             min_runs: int = MIN_HISTORY,
+             warnings: list[str] | None = None) -> dict | None:
+    """Return {median_cost, median_tokens, runs} or None if not enough
+    history. Breached runs are excluded -- they were, by definition,
+    not normal. Corrupt lines are skipped; a note is appended to
+    ``warnings`` (when given) saying how many."""
+    costs, tokens = _runs(agent, profile, path, warnings)
     if len(costs) < min_runs:
         return None
     return {
