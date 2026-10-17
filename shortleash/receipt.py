@@ -17,12 +17,17 @@ _FLAG_EQ_RE = re.compile(r"^(--?)([A-Za-z0-9_][A-Za-z0-9_-]*)=(.*)$")
 _BARE_EQ_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_-]*)=(.*)$")
 _FLAG_RE = re.compile(r"^(--?)([A-Za-z0-9_][A-Za-z0-9_-]*)$")
 
+#: Flags whose next argument is the prompt text (Claude Code: `-p`/`--print`
+#: is a flag and the prompt follows it in the usual `claude -p "..."`).
+PROMPT_FLAGS = ("-p", "--print", "--prompt")
+REDACTED_PROMPT = "<redacted>"
+
 
 def _is_secret_name(name: str) -> bool:
     return _SECRET_NAME_RE.search(name) is not None
 
 
-def redact_argv(argv: list[str]) -> list[str]:
+def redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
     """Return argv with secret values replaced by ***.
 
     Never mutate the original. Handles three shapes:
@@ -31,14 +36,35 @@ def redact_argv(argv: list[str]) -> list[str]:
       api_key=sk-123     -> ["api_key=***"]
     Matching is substring on the argument name (e.g. "monkey" would also
     match — over-redaction is the safe direction).
+
+    The PROMPT is not a secret by this rule and is stored verbatim: with
+    ``redact_prompt`` the argument following -p/--print/--prompt (and a
+    --prompt=... value) becomes "<redacted>" instead. A prompt passed any
+    other way (bare positional, stdin, a file) is not recognised.
     """
     out: list[str] = []
     redact_next = False
+    prompt_next = False
     for a in argv:
         if redact_next:
             out.append("***")
             redact_next = False
             continue
+        if prompt_next:
+            prompt_next = False
+            if not a.startswith("-"):
+                out.append(REDACTED_PROMPT)
+                continue
+        if redact_prompt:
+            if a in PROMPT_FLAGS:
+                out.append(a)
+                prompt_next = True
+                continue
+            eq_flag = next((f for f in PROMPT_FLAGS if a.startswith(f + "=")),
+                           None)
+            if eq_flag:
+                out.append(f"{eq_flag}={REDACTED_PROMPT}")
+                continue
         m = _FLAG_EQ_RE.match(a)
         if m:
             prefix, name, value = m.groups()
@@ -84,12 +110,18 @@ def build_receipt(
     not_enforced: list[str] | None = None,
     pricing: dict | None = None,
     warnings: list[str] | None = None,
+    redact_prompt: bool = False,
+    agent_error: bool = False,
+    agent_error_text: str = "",
+    hint: str | None = None,
 ) -> dict:
     return {
         "tool": "shortleash",
         "version": __version__,
         # Never persist raw argv: redact anything that looks like a secret.
-        "command": redact_argv(command),
+        # The prompt itself is kept unless --redact-prompt was given.
+        "command": redact_argv(command, redact_prompt=redact_prompt),
+        "prompt_redacted": bool(redact_prompt),
         "agent": agent,
         "profile": profile,
         "baseline": baseline,
@@ -120,6 +152,13 @@ def build_receipt(
         "not_enforced": list(not_enforced or []),
         "pricing": pricing,
         "warnings": list(warnings or []),
+        # The agent's own verdict: a stream-json `result` with is_error
+        # true is a failed run even when the process exited 0.
+        "agent_error": bool(agent_error),
+        "agent_error_text": agent_error_text or "",
+        # One line of advice printed under STOPPED (e.g. how to leave the
+        # anomaly ratchet), or None.
+        "hint": hint,
     }
 
 
@@ -168,6 +207,12 @@ def format_human(receipt: dict) -> str:
                      f"provider pricing")
     if receipt["breached"]:
         lines.append(f"  STOPPED:   {receipt['breach_reason']}")
+        if receipt.get("hint"):
+            lines.append(f"  hint:      {receipt['hint']}")
+    elif receipt.get("agent_error"):
+        detail = receipt.get("agent_error_text") or "no detail"
+        lines.append(f"  FAILED:    the agent reported is_error "
+                     f"({detail})")
     elif not telemetry:
         # Never print the green tick here: a cost cap cannot have held
         # when the child never reported any usage.

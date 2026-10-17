@@ -105,10 +105,27 @@ class TestNegativeCapsRejected(unittest.TestCase):
         self._expect_rejection("--max-tokens", "-3")
 
     def test_negative_timeout(self):
-        self._expect_rejection("--timeout", "-0.5")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            with self.assertRaises(SystemExit) as cm:
+                cli_mod.main(["run", "--timeout", "-0.5", "--", "true"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--timeout must be > 0", err.getvalue())
+
+    def test_zero_timeout_rejected(self):
+        # Round 3 (L-7): --timeout 0 used to trip the instant the child
+        # started ("time limit exceeded: 0s"); it is a usage error now.
+        err = io.StringIO()
+        with redirect_stderr(err):
+            with self.assertRaises(SystemExit) as cm:
+                cli_mod.main(["run", "--timeout", "0", "--", "true"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--timeout must be > 0", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
 
     def test_zero_caps_still_allowed(self):
-        """Zero is a valid (draconian) cap — validation must not fire."""
+        """Zero is a valid (draconian) budget/spawn/token cap — validation
+        must not fire (only --timeout needs to be positive)."""
         seen = {}
 
         class StubGuard:
@@ -123,13 +140,13 @@ class TestNegativeCapsRejected(unittest.TestCase):
             with redirect_stderr(err):
                 code = cli_mod.main(
                     ["run", "--budget", "0", "--max-spawns", "0",
-                     "--max-tokens", "0", "--timeout", "0",
+                     "--max-tokens", "0",
                      "--quiet", "--no-anomaly", "--", "true"])
         self.assertEqual(code, 0)
         self.assertEqual(seen["budget"], 0)
         self.assertEqual(seen["max_spawns"], 0)
         self.assertEqual(seen["max_tokens"], 0)
-        self.assertEqual(seen["timeout"], 0)
+        self.assertIsNone(seen["timeout"])
 
 
 class TestVersionSingleSource(unittest.TestCase):

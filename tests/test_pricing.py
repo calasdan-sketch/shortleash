@@ -34,22 +34,27 @@ class TestPricing(unittest.TestCase):
         self.assertAlmostEqual(
             pricing.estimate_cost("mystery-model-9", usage), 3.00)
 
-    def test_load_pricing_override(self):
+    def test_load_table_override(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json",
                                          delete=False) as f:
             json.dump({"sonnet": [10.0, 20.0]}, f)
             path = f.name
         try:
-            table = pricing.load_pricing(path)
+            table = pricing.load_table(path, environ={})
             usage = {"input": 1_000_000, "output": 0,
                      "cache_write": 0, "cache_read": 0}
             self.assertAlmostEqual(
                 pricing.estimate_cost("claude-sonnet-4-5", usage, table), 10.00)
+            # a plain rates dict still works for estimate_cost
+            self.assertAlmostEqual(
+                pricing.estimate_cost("claude-sonnet-4-5", usage, table.rates),
+                10.00)
         finally:
             os.unlink(path)
 
-    def test_load_pricing_none_returns_defaults(self):
-        self.assertEqual(pricing.load_pricing(None), pricing.DEFAULT_PRICING)
+    def test_load_table_none_returns_defaults(self):
+        self.assertEqual(pricing.load_table(None, environ={}).rates,
+                         pricing.DEFAULT_PRICING)
 
 
 if __name__ == "__main__":

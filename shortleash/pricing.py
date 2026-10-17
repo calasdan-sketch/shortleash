@@ -88,17 +88,6 @@ def _parse_rates(data: dict, pricing: dict, where: str) -> str | None:
     return as_of
 
 
-def load_pricing(path: str | None) -> dict:
-    """Return the rates dict (defaults overlaid with the JSON file at path)."""
-    if not path:
-        return dict(DEFAULT_PRICING)
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    pricing = dict(DEFAULT_PRICING)
-    _parse_rates(data, pricing, path)
-    return pricing
-
-
 def load_table(path: str | None = None,
                environ: dict | None = None) -> PricingTable:
     """Resolve the pricing table: --pricing path, else $SHORTLEASH_PRICING,

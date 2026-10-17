@@ -3,12 +3,18 @@
 Wraps an agent command, tails its stream-json telemetry in real time,
 and kills the run the moment it breaches a guardrail — budget, spawn
 cap, token cap, or wall-clock timeout. Emits a per-run receipt.
+
+Subcommands:
+  run    the leash (this tool's purpose)
+  fleet  see who holds a fleet claim (`fleet list`)
+  cache  a separate helper: the prompt-caching optimizer (cacheopt.py).
+         It shares nothing with the leash but the package; see the README
+         section of the same name.
 """
 
 import argparse
 import atexit
 import os
-import signal
 import sys
 
 from . import cacheopt
@@ -16,6 +22,8 @@ from . import fleet as fleet_mod
 from . import guard as guard_mod
 from . import pricing
 from . import __version__
+
+DEFAULT_ANOMALY = 3.0
 
 
 def _harden_streams() -> None:
@@ -33,18 +41,7 @@ def _harden_streams() -> None:
             pass
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="shortleash",
-        description=(
-            "Circuit breaker for AI coding-agent runs. Wraps a command, "
-            "enforces guardrails live, kills on breach."
-        ),
-    )
-    p.add_argument("--version", action="version",
-                   version=f"%(prog)s {__version__}")
-    sub = p.add_subparsers(dest="cmd", required=True)
-
+def _add_run_parser(sub) -> None:
     r = sub.add_parser("run", help="Run a command under guardrails.")
     r.add_argument("--budget", type=float, default=None,
                    help="Max estimated spend in USD before the run is killed.")
@@ -53,7 +50,8 @@ def _build_parser() -> argparse.ArgumentParser:
     r.add_argument("--max-tokens", type=int, default=None,
                    help="Max total tokens (in+out+cache) before the run is killed.")
     r.add_argument("--timeout", type=float, default=None,
-                   help="Max wall-clock seconds before the run is killed.")
+                   help="Max wall-clock seconds before the run is killed "
+                        "(must be > 0).")
     r.add_argument("--grace-period", type=float, default=5.0,
                    help="Seconds between SIGTERM and SIGKILL on breach "
                         "(POSIX; Windows force-kills the tree at once), "
@@ -66,14 +64,21 @@ def _build_parser() -> argparse.ArgumentParser:
                         "against provider pricing.")
     r.add_argument("--receipt", type=str, default=None,
                    help="Write the per-run receipt JSON to this path.")
+    r.add_argument("--redact-prompt", action="store_true",
+                   help="Replace the prompt (the argument after -p/--print/"
+                        "--prompt) with <redacted> in the receipt. Prompts "
+                        "are stored verbatim otherwise.")
     r.add_argument("--quiet", action="store_true",
                    help="Suppress the human-readable receipt on stderr.")
-    r.add_argument("--anomaly", type=float, default=3.0, metavar="MULT",
-                   help="Trip when live cost/tokens exceed MULT x the historical "
-                        "median for this agent (default 3.0). Needs --min-history "
-                        "past runs to arm.")
+    r.add_argument("--anomaly", type=float, default=None, nargs="?",
+                   const=DEFAULT_ANOMALY, metavar="MULT",
+                   help="Opt in to anomaly mode: trip when live cost/tokens "
+                        f"exceed MULT x the historical median for this agent "
+                        f"(MULT defaults to {DEFAULT_ANOMALY}). Arms only "
+                        "after --min-history past runs. Off unless given.")
     r.add_argument("--no-anomaly", action="store_true",
-                   help="Disable historical-baseline anomaly detection.")
+                   help="Accepted for compatibility: anomaly mode is already "
+                        "off unless --anomaly is given.")
     r.add_argument("--profile", type=str, default="",
                    help="Baseline grouping key (default: agent binary name).")
     r.add_argument("--history-path", type=str, default=None,
@@ -93,7 +98,18 @@ def _build_parser() -> argparse.ArgumentParser:
     r.add_argument("command", nargs=argparse.REMAINDER,
                    help="Command to run, after -- : shortleash run --budget 2 -- claude -p ...")
 
-    c = sub.add_parser("cache", help="Prompt-caching optimizer.")
+
+def _add_fleet_parser(sub) -> None:
+    f = sub.add_parser("fleet", help="Fleet claims held on this machine.")
+    fsub = f.add_subparsers(dest="fleet_cmd", required=True)
+    fsub.add_parser("list", help="Show who currently holds which path.")
+
+
+def _add_cache_parser(sub) -> None:
+    # A separate helper that happens to live in this package: it never
+    # touches the leash, the receipt or the history.
+    c = sub.add_parser("cache", help="Prompt-caching optimizer (separate "
+                                     "helper, unrelated to the leash).")
     csub = c.add_subparsers(dest="cache_cmd", required=True)
     csub.add_parser("guide", help="Provider caching docs + the core rule.")
     ck = csub.add_parser("check", help="Report how cacheable a prompt is.")
@@ -107,6 +123,22 @@ def _build_parser() -> argparse.ArgumentParser:
     cm.add_argument("--provider", default="all",
                     choices=["all", "anthropic", "openai", "gemini", "deepseek"],
                     help="Emit integration snippet for provider(s).")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="shortleash",
+        description=(
+            "Circuit breaker for AI coding-agent runs. Wraps a command, "
+            "enforces guardrails live, kills on breach."
+        ),
+    )
+    p.add_argument("--version", action="version",
+                   version=f"%(prog)s {__version__}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    _add_run_parser(sub)
+    _add_fleet_parser(sub)
+    _add_cache_parser(sub)
     return p
 
 
@@ -171,6 +203,40 @@ def _cmd_cache(args) -> int:
     return 0
 
 
+def _cmd_fleet(args) -> int:
+    conn = fleet_mod.connect()
+    try:
+        claims = fleet_mod.active_claims(conn)
+    finally:
+        conn.close()
+    if not claims:
+        print("no active fleet claims")
+        return 0
+    for c in claims:
+        line = (f"{c['claim_id']}  {c['path']}  held by "
+                f"{c['owner'] or '?'}  ({c['ttl_left']}s left)")
+        if c["note"]:
+            line += f"  — {c['note']}"
+        print(line)
+    return 0
+
+
+def _caps_banner(args) -> str:
+    """Only the caps that are actually set — never `budget=$None`."""
+    caps = []
+    if args.budget is not None:
+        caps.append(f"budget=${args.budget:g}")
+    if args.max_spawns is not None:
+        caps.append(f"max_spawns={args.max_spawns}")
+    if args.max_tokens is not None:
+        caps.append(f"max_tokens={args.max_tokens}")
+    if args.timeout is not None:
+        caps.append(f"timeout={args.timeout:g}s")
+    if args.anomaly is not None:
+        caps.append(f"anomaly={args.anomaly:g}x (needs {args.min_history} runs)")
+    return " ".join(caps) if caps else "no caps set (nothing will be enforced)"
+
+
 def main(argv: list[str] | None = None) -> int:
     _harden_streams()
     parser = _build_parser()
@@ -178,15 +244,23 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "cache":
         return _cmd_cache(args)
+    if args.cmd == "fleet":
+        return _cmd_fleet(args)
     if args.cmd == "run":
         # Guardrail caps must be non-negative; a negative cap would either
         # trip every run instantly or (worse) disable the check silently.
         for flag, value in (("--budget", args.budget),
                             ("--max-spawns", args.max_spawns),
-                            ("--max-tokens", args.max_tokens),
-                            ("--timeout", args.timeout)):
+                            ("--max-tokens", args.max_tokens)):
             if value is not None and value < 0:
                 parser.error(f"{flag} must be >= 0 (got {value})")
+        # A zero timeout would trip the instant the child starts.
+        if args.timeout is not None and args.timeout <= 0:
+            parser.error(f"--timeout must be > 0 seconds (got {args.timeout:g})")
+        if args.anomaly is not None and args.anomaly <= 0:
+            parser.error(f"--anomaly must be > 0 (got {args.anomaly:g})")
+        if args.no_anomaly:
+            args.anomaly = None
         # argparse puts everything after `--` in `command`, possibly
         # with a leading `--` itself.
         cmd = list(args.command)
@@ -214,22 +288,19 @@ def main(argv: list[str] | None = None) -> int:
             pricing_table=pricing_table,
             receipt_path=args.receipt,
             quiet=args.quiet,
-            anomaly=None if args.no_anomaly else args.anomaly,
+            anomaly=args.anomaly,
             profile=args.profile,
             history_path=args.history_path,
             min_history=args.min_history,
+            redact_prompt=args.redact_prompt,
         )
-        caps = [f"budget=${args.budget}", f"max_spawns={args.max_spawns}",
-                f"max_tokens={args.max_tokens}", f"timeout={args.timeout}"]
-        if not args.no_anomaly:
-            caps.append(f"anomaly={args.anomaly}x (needs {args.min_history} runs)")
         if not args.quiet:
             # Never echo the full argv: it may contain secrets. Show only
             # the agent binary name alongside the caps.
             agent_bin = guard_mod.agent_name(cmd[0])
             sys.stderr.write(
                 f"[shortleash] guarding: {agent_bin}\n"
-                f"[shortleash] {' '.join(caps)}\n"
+                f"[shortleash] {_caps_banner(args)}\n"
                 f"[shortleash] pricing: {pricing_table.describe()}\n"
             )
         if args.fleet:
@@ -240,8 +311,9 @@ def main(argv: list[str] | None = None) -> int:
 
 def _run_with_fleet(g, cmd: list[str], args) -> int:
     """Hold a fleet claim for the run. Warn-don't-block on conflict;
-    release on exit via finally + atexit + signal handlers, with the
-    claim TTL as the backstop for SIGKILL."""
+    release on exit. The Guard itself turns Ctrl-C/SIGTERM into a clean
+    return (tree killed, receipt written), so the release runs in the
+    `finally`; atexit and the claim TTL back it up for a hard kill."""
     paths = args.claim or [os.getcwd()]
     conn = fleet_mod.connect()
     try:
@@ -251,6 +323,8 @@ def _run_with_fleet(g, cmd: list[str], args) -> int:
     except ValueError as e:
         print(f"shortleash: fleet claim error: {e}", file=sys.stderr)
         return 2
+    finally:
+        conn.close()
     claim_id = res.get("claim_id")
 
     def _release() -> None:
@@ -278,21 +352,9 @@ def _run_with_fleet(g, cmd: list[str], args) -> int:
                 + (f": {h['note']}" if h["note"] else "") + "\n")
 
     atexit.register(_release)
-    old_term = signal.getsignal(signal.SIGTERM)
-    old_int = signal.getsignal(signal.SIGINT)
-
-    def _on_signal(signum, frame):
-        _release()
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
-
-    signal.signal(signal.SIGTERM, _on_signal)
-    signal.signal(signal.SIGINT, _on_signal)
     try:
         return g.run(cmd)
     finally:
-        signal.signal(signal.SIGTERM, old_term)
-        signal.signal(signal.SIGINT, old_int)
         _release()
 
 

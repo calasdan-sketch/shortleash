@@ -152,10 +152,8 @@ class TestPricingLabels(unittest.TestCase):
         self.assertEqual(t.rates["sonnet"], (10.0, 20.0))
         self.assertEqual(t.rates["opus"], pricing.DEFAULT_PRICING["opus"])
         self.assertEqual(t.source, path)
-        # the legacy loader must not misread "as_of" as a [2, 0] rate pair
-        table = pricing.load_pricing(path)
-        self.assertNotIn("as_of", table)
-        self.assertEqual(table["sonnet"], (10.0, 20.0))
+        # "as_of" must never be read as a [2, 0] rate pair
+        self.assertNotIn("as_of", t.rates)
 
     def test_env_var_override(self):
         path = self._write({"as_of": "2027-03-04", "haiku": [1.0, 2.0]})

@@ -7,25 +7,37 @@ Design:
 - A monitor thread reads the child's stdout line-by-line, parses
   stream-json events, passes every line through to our stdout
   (so the user still watches the agent work), and checks caps after
-  each observation.
+  each observation. If our stdout goes away (`| head -1`), echoing stops
+  and parsing continues -- the caps still hold.
 - On breach: kill the whole tree (SIGTERM, grace period, SIGKILL on
-  POSIX; taskkill /T /F on Windows).
+  POSIX; Job Object / taskkill /T /F on Windows).
 - A watchdog thread enforces --timeout even when the child goes silent.
+- Ctrl-C / SIGTERM to the leash: the child is in its own process group
+  (and, on Windows, ignores console Ctrl-C), so the signal reaches only
+  us. We kill the tree, write the receipt and exit 130 (Ctrl-C) or 143
+  (SIGTERM) -- never die with a traceback leaving the agent running.
 - Escaped grandchildren: when the child exits but something it spawned
   still holds our stdout pipe open, the monitor would block forever and
   the leash would never return. After the child exits we wait at most
   one grace period for the pipe to close, then kill the stragglers by
-  process group and move on — we never block on closing the pipe.
+  process group and move on -- we never block on closing the pipe.
+- Usage de-duplication: Claude Code emits one `assistant` event per
+  content block, all carrying the same message id and the same usage.
+  Usage is counted once per message id (growing fields are topped up,
+  never added twice); spawns are counted once per tool_use block id.
 - Exit code 124 on guard-triggered kill (mirrors timeout(1)); 125 when
   a telemetry-dependent cap was requested but the child never sent any
-  usage telemetry (the cap could not have been enforced); otherwise the
-  child's exit code.
+  usage telemetry (the cap could not have been enforced); 130/143 on
+  Ctrl-C/SIGTERM; 1 when the agent's final result says is_error although
+  the process exited 0; a child killed by signal N outside a breach is
+  128+N like a shell; otherwise the child's exit code.
 """
 
 from __future__ import annotations
 
+import collections
 import os
-import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -33,6 +45,7 @@ import time
 
 from . import events
 from . import history as history_mod
+from . import launch
 from . import pricing
 from . import proctree
 from . import receipt as receipt_mod
@@ -41,8 +54,26 @@ BREACH_EXIT_CODE = 124
 #: A budget/token/spawn/anomaly cap was requested, but the child sent no
 #: usage telemetry, so only the wall-clock limit (if any) was enforced.
 NO_TELEMETRY_EXIT_CODE = 125
+#: The leash itself was interrupted (Ctrl-C) / terminated (SIGTERM); the
+#: tree was killed and a receipt written. 128 + signal, like a shell.
+INTERRUPTED_EXIT_CODE = 130
+TERMINATED_EXIT_CODE = 143
+#: The process exited 0 but its stream-json result said is_error.
+AGENT_ERROR_EXIT_CODE = 1
+
+ANOMALY_HINT = ("stopped by anomaly mode, so this run is NOT in the baseline "
+                "and would be stopped again: re-run without --anomaly to let "
+                "it finish and be recorded, or use --profile NAME for a "
+                "separate baseline")
 
 _EXE_SUFFIXES = (".exe", ".cmd", ".bat", ".com", ".ps1")
+#: How many message ids to remember for usage de-duplication. The split
+#: events of one message are consecutive, so a small window is plenty.
+_MESSAGE_WINDOW = 256
+
+
+class _Terminated(BaseException):
+    """Raised in the main thread by the SIGTERM handler to unwind wait()."""
 
 
 def _child_stderr():
@@ -78,13 +109,14 @@ class Guard:
         max_tokens: int | None = None,
         timeout: float | None = None,
         grace_period: float = 5.0,
-        pricing_table=None,
+        pricing_table: pricing.PricingTable | None = None,
         receipt_path: str | None = None,
         quiet: bool = False,
-        anomaly: float | None = 3.0,
+        anomaly: float | None = None,
         profile: str = "",
         history_path: str | None = None,
         min_history: int = history_mod.MIN_HISTORY,
+        redact_prompt: bool = False,
     ):
         self.budget = budget
         self.max_spawns = max_spawns
@@ -93,10 +125,6 @@ class Guard:
         self.grace_period = grace_period
         if pricing_table is None:
             pricing_table = pricing.PricingTable(rates=dict(pricing.DEFAULT_PRICING))
-        elif not isinstance(pricing_table, pricing.PricingTable):
-            # plain rates dict (older callers/tests): wrap it
-            pricing_table = pricing.PricingTable(
-                rates=dict(pricing_table), source="custom table")
         self.pricing_table = pricing_table
         self.receipt_path = receipt_path
         self.quiet = quiet
@@ -104,22 +132,33 @@ class Guard:
         self.profile = profile
         self.history_path = history_path
         self.min_history = min_history
+        self.redact_prompt = redact_prompt
         self._baseline: dict | None = None
         self.agent = ""
 
         self._lock = threading.Lock()
         self.usage = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
+        # message id -> the largest usage seen for it (de-duplication)
+        self._seen_messages: collections.OrderedDict[str, dict] = \
+            collections.OrderedDict()
+        self._seen_spawns: set[str] = set()
         self.spawns = 0
         self.num_turns = 0
         self.model = ""
         self.session_id = ""
         self.reported_cost: float | None = None
         self.usage_events = 0
+        self.agent_error = False
+        self.agent_error_text = ""
         self.breached = False
         self.breach_reason: str | None = None
+        self.interrupted_by: str | None = None  # "SIGINT" / "SIGTERM"
+        self._in_wait = False
         self.escaped = False
+        self.echo = True
         self.warnings: list[str] = []
         self.proc: subprocess.Popen | None = None
+        self.job = None
         self.started_at = 0.0
 
     # -- accounting -------------------------------------------------
@@ -129,10 +168,33 @@ class Guard:
         # Clamp to >= 0 so a misbehaving child reporting negative usage
         # can never drive totals down and blind the caps.
         with self._lock:
-            u = obs["usage"]
-            for k in self.usage:
-                self.usage[k] += max(0, u.get(k, 0))
-            self.spawns += max(0, obs.get("spawns", 0))
+            u = {k: max(0, obs["usage"].get(k, 0)) for k in self.usage}
+            mid = obs.get("message_id") or ""
+            if mid and mid in self._seen_messages:
+                # Same API response, next content block: usage repeats.
+                # Count only growth (output tokens can still rise), never
+                # the same tokens twice.
+                prev = self._seen_messages[mid]
+                for k in self.usage:
+                    self.usage[k] += max(0, u[k] - prev[k])
+                    prev[k] = max(prev[k], u[k])
+                self._seen_messages.move_to_end(mid)
+            else:
+                for k in self.usage:
+                    self.usage[k] += u[k]
+                if mid:
+                    self._seen_messages[mid] = dict(u)
+                    while len(self._seen_messages) > _MESSAGE_WINDOW:
+                        self._seen_messages.popitem(last=False)
+            spawn_ids = obs.get("spawn_ids")
+            if spawn_ids is None:
+                self.spawns += max(0, obs.get("spawns", 0))
+            else:
+                for sid in spawn_ids:
+                    key = f"{mid}:{sid}" if sid.startswith("<no-id>") else sid
+                    if key not in self._seen_spawns:
+                        self._seen_spawns.add(key)
+                        self.spawns += 1
             self.usage_events += 1
 
     def estimated_cost(self) -> float:
@@ -221,12 +283,42 @@ class Guard:
 
     # -- monitor -----------------------------------------------------
 
-    def _monitor_stdout(self) -> None:
-        assert self.proc is not None and self.proc.stdout is not None
-        out = sys.stdout
-        for line in self.proc.stdout:
+    def _echo_line(self, line: str) -> None:
+        """Pass one child line through to our stdout. When stdout is gone
+        (closed pipe, `| head -1`) stop echoing but keep parsing: the
+        caps must hold whether or not anyone is watching."""
+        if not self.echo:
+            return
+        try:
+            out = sys.stdout
             out.write(line)
             out.flush()
+        except (OSError, ValueError, AttributeError):
+            self.echo = False
+            self.warnings.append(
+                "stdout closed while the agent was running; its output was "
+                "no longer echoed (telemetry parsing continued)")
+            self._silence_stdout()
+
+    @staticmethod
+    def _silence_stdout() -> None:
+        """Point fd 1 at the null device so the interpreter's own flush at
+        exit cannot fail with another BrokenPipeError."""
+        try:
+            fd = sys.stdout.fileno()
+        except (AttributeError, OSError, ValueError):
+            return
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, fd)
+            os.close(devnull)
+        except OSError:
+            pass
+
+    def _monitor_stdout(self) -> None:
+        assert self.proc is not None and self.proc.stdout is not None
+        for line in self.proc.stdout:
+            self._echo_line(line)
             try:
                 # FAIL-CLOSED trust boundary: the child is untrusted. If a
                 # telemetry line cannot be parsed cleanly (bad JSON, or a
@@ -267,6 +359,10 @@ class Guard:
                 self.num_turns = obs.get("num_turns") or self.num_turns
                 if obs.get("session_id"):
                     self.session_id = obs["session_id"]
+                if obs.get("is_error"):
+                    self.agent_error = True
+                    self.agent_error_text = (obs.get("error_text")
+                                             or obs.get("subtype") or "")
         return obs
 
     def _watchdog(self) -> None:
@@ -312,6 +408,78 @@ class Guard:
                 "the command left child process(es) running after it "
                 "exited; they ended on their own during the grace period")
 
+    # -- signals -------------------------------------------------------
+
+    def _on_sigterm(self, signum, frame):
+        if self._in_wait:
+            raise _Terminated()
+        # Not inside the wait loop (launching, or already writing the
+        # receipt): kill the tree now and let run() finish normally.
+        self._interrupt("SIGTERM", "terminated (SIGTERM)")
+
+    def _install_sigterm(self):
+        """Route SIGTERM through the same path as Ctrl-C. Only the main
+        thread may set handlers; elsewhere (Guard.run in a worker thread)
+        the default action stands. Returns the previous handler or None."""
+        if threading.current_thread() is not threading.main_thread():
+            return None
+        try:
+            return signal.signal(signal.SIGTERM, self._on_sigterm)
+        except (ValueError, OSError, AttributeError):
+            return None
+
+    @staticmethod
+    def _restore_sigterm(previous) -> None:
+        if previous is None:
+            return
+        try:
+            signal.signal(signal.SIGTERM, previous)
+        except (ValueError, OSError, AttributeError):
+            pass
+
+    def _wait_child(self) -> int | None:
+        """Wait for the child, handling Ctrl-C and SIGTERM to the leash.
+
+        Polls with a short timeout rather than wait() alone: on Windows an
+        indefinite WaitForSingleObject is not interruptible, so Ctrl-C
+        would only be noticed once the child exited on its own. After a
+        kill the wait is bounded; None means the tree would not die.
+        """
+        proc = self.proc
+        assert proc is not None
+        deadline: float | None = None
+        while True:
+            if deadline is not None and time.monotonic() > deadline:
+                self.warnings.append(
+                    "the agent process did not exit after the kill; the "
+                    "leash stopped waiting for it")
+                return None
+            self._in_wait = True
+            try:
+                return proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                continue
+            except KeyboardInterrupt:
+                self._interrupt("SIGINT", "interrupted (Ctrl-C)")
+            except _Terminated:
+                self._interrupt("SIGTERM", "terminated (SIGTERM)")
+            finally:
+                self._in_wait = False
+            if deadline is None:
+                deadline = time.monotonic() + self.grace_period + 10.0
+
+    def _interrupt(self, which: str, reason: str) -> None:
+        """The leash was signalled: trip, kill the tree, keep waiting. A
+        second Ctrl-C during the grace period force-kills right away."""
+        if self.interrupted_by is None:
+            self.interrupted_by = which
+        try:
+            self._trip(f"{reason}: the leash was signalled and killed the "
+                       f"agent's process tree")
+        except (KeyboardInterrupt, _Terminated):
+            self.grace_period = 0.0
+            self._kill_tree()
+
     # -- main ---------------------------------------------------------
 
     def run(self, argv: list[str]) -> int:
@@ -322,16 +490,18 @@ class Guard:
         if self.anomaly is not None:
             self._baseline = history_mod.baseline(
                 self.agent, profile=self.profile,
-                path=self.history_path, min_runs=self.min_history)
+                path=self.history_path, min_runs=self.min_history,
+                warnings=self.warnings)
         self.proc = None
         self.job = None
-        # Resolve the executable ourselves: on Windows, CreateProcess does
-        # not look up PATHEXT shims such as claude.cmd, shutil.which does.
-        cmd = list(argv)
-        if cmd:
-            resolved = shutil.which(cmd[0])
-            if resolved:
-                cmd[0] = resolved
+        # Resolve the executable ourselves (PATHEXT shims on Windows) and
+        # never hand prompt text to cmd.exe through a .cmd shim.
+        try:
+            cmd = launch.resolve_command(argv)
+        except launch.LaunchError as e:
+            sys.stderr.write(f"shortleash: error: {e}\n")
+            sys.stderr.flush()
+            return 2
         try:
             self.proc = subprocess.Popen(
                 cmd,
@@ -360,7 +530,11 @@ class Guard:
         watchdog = threading.Thread(target=self._watchdog, daemon=True)
         watchdog.start()
 
-        exit_code = self.proc.wait()
+        previous_term = self._install_sigterm()
+        try:
+            exit_code = self._wait_child()
+        finally:
+            self._restore_sigterm(previous_term)
         self._reap_stragglers(monitor)
         if not monitor.is_alive():
             # Only close the pipe once the reader is done: closing a
@@ -382,8 +556,25 @@ class Guard:
             requested if telemetry else [])
         not_enforced = [] if telemetry else requested
 
+        if exit_code is None:
+            exit_code = BREACH_EXIT_CODE  # the tree would not die (warned)
+        elif exit_code < 0:
+            # POSIX: killed by signal N (outside a breach) -> 128+N, as a
+            # shell would report it, instead of a negative number.
+            exit_code = 128 - exit_code
+        hint = None
         if self.breached:
-            exit_code = BREACH_EXIT_CODE
+            if self.interrupted_by == "SIGINT":
+                exit_code = INTERRUPTED_EXIT_CODE
+            elif self.interrupted_by == "SIGTERM":
+                exit_code = TERMINATED_EXIT_CODE
+            else:
+                exit_code = BREACH_EXIT_CODE
+            if (self.breach_reason or "").startswith("anomaly"):
+                hint = ANOMALY_HINT
+        elif self.agent_error and exit_code == 0:
+            # The agent said the run failed even though it exited 0.
+            exit_code = AGENT_ERROR_EXIT_CODE
         elif not telemetry and requested and exit_code == 0:
             # The child succeeded, but the caps the user asked for were
             # never checked against anything: say so in the exit code.
@@ -419,6 +610,10 @@ class Guard:
             pricing={"as_of": self.pricing_table.as_of,
                      "source": self.pricing_table.source},
             warnings=list(self.warnings),
+            redact_prompt=self.redact_prompt,
+            agent_error=self.agent_error,
+            agent_error_text=self.agent_error_text,
+            hint=hint,
         )
         if self.receipt_path:
             receipt_mod.write_receipt(rec, self.receipt_path)

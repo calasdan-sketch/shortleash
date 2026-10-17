@@ -12,18 +12,17 @@ Vendors' "budgets" only warn while the meter keeps running. This one halts.
 Zero dependencies — Python 3.10+ stdlib only.
 
 ```bash
-git clone <repo> && cd shortleash
-# run directly:
+pip install git+https://github.com/calasdan-sketch/shortleash
+shortleash run --budget 2.00 -- <command>
+
+# or, from a checkout, without installing:
 python3 -m shortleash run --budget 2.00 -- <command>
-# or add an alias (from the repo root, no install):
-alias shortleash="python3 -m shortleash"
-# or install for the `shortleash` console script:
-pip install .
 ```
 
 Works on Linux, macOS and Windows 11 (Python 3.10+). On Windows, `claude`
-is found through `PATHEXT` (the npm `claude.cmd` shim), and console output
-never dies on a cp1252 code page — unencodable characters are replaced.
+is found through `PATHEXT` (the npm `claude.cmd` shim — see *Windows*
+below), and console output never dies on a cp1252 code page — unencodable
+characters are replaced.
 
 ## Usage
 
@@ -38,24 +37,50 @@ shortleash run --budget 5.00 --max-spawns 10 --max-tokens 500000 \
   claude -p "migrate the database layer"
 ```
 
-### Anomaly mode (the smart default)
+Only the caps you set are enforced; the banner lists them (or says
+`no caps set`). `--timeout` must be greater than zero.
+
+When wrapping `claude`, `--output-format stream-json --verbose` are added
+automatically (the guard needs the telemetry stream). The agent's stdout
+passes through untouched, so you still watch it work — and if whatever is
+reading it goes away (`shortleash run … | head -1`), the echo stops but the
+caps keep being checked; the receipt notes it.
+
+### Stopping the leash (Ctrl-C, SIGTERM)
+
+The agent runs in its own process group, so a Ctrl-C in your terminal (or a
+`kill` from a supervisor) reaches **only the leash**. The leash then kills
+the agent's whole process tree, writes the receipt (`STOPPED: interrupted
+(Ctrl-C)` / `terminated (SIGTERM)`) and exits `130` / `143` — it never dies
+with a traceback leaving the agent running. A second Ctrl-C during the
+grace period force-kills at once.
+
+### Anomaly mode (`--anomaly`, opt-in)
 
 Static caps punish legitimate big tasks. Anomaly mode learns instead:
-every receipt is appended to `~/.shortleash/history.jsonl` (or under
-`$SHORTLEASH_HOME`), and once an agent has 5+ past runs, the guard trips only when the live run exceeds
-**3× the historical median** cost or tokens for that agent.
+every run with telemetry is appended to `~/.shortleash/history.jsonl` (or
+under `$SHORTLEASH_HOME`; no command text or prompt is stored there), and
+with `--anomaly` the guard trips once an agent has 5+ past runs and the
+live run exceeds **3× the historical median** cost or tokens for that agent.
 
 ```bash
-shortleash run -- claude -p "migrate the database layer"
-# [shortleash] anomaly=3.0x (needs 5 runs)
+shortleash run --anomaly -- claude -p "migrate the database layer"
+# [shortleash] anomaly=3x (needs 5 runs)
 # ...
-# STOPPED: anomaly: estimated $4.21 is 5.3x the typical $0.79 across 23 past runs
+# STOPPED:   anomaly: estimated $4.21 is 5.3x the typical $0.79 across 23 past runs
+# hint:      stopped by anomaly mode, so this run is NOT in the baseline and would
+#            be stopped again: re-run without --anomaly to let it finish and be
+#            recorded, or use --profile NAME for a separate baseline
 ```
 
-A naturally large task establishes its own baseline over time; only true
-runaways trip. Breached runs are excluded from baselines. Tune with
-`--anomaly 5.0`, `--min-history 10`, `--profile big-refactor` (separate
-baseline), or `--no-anomaly` to disable.
+Know the ratchet: **breached runs are excluded from the baseline**, so a
+legitimately larger task that anomaly mode stops does *not* teach the
+baseline anything — it would be stopped again on every attempt. That is
+why anomaly mode is off unless you ask for it, and why the STOPPED line
+tells you the way out: run the task once without `--anomaly` (it is then
+recorded and the median moves), or give it its own baseline with
+`--profile big-refactor`. Tune with `--anomaly 5.0` and `--min-history 10`.
+`--no-anomaly` is still accepted (it is the default).
 
 ### Fleet mode (`--fleet`)
 
@@ -66,6 +91,8 @@ retired claimlock:
 ```bash
 shortleash run --fleet --budget 3 -- claude -p "refactor the api layer"
 # [shortleash] fleet claim ce63a732a87b: /home/dan/project
+shortleash fleet list
+# ce63a732a87b  /home/dan/project  held by dan  (1791s left)  — shortleash run: claude
 ```
 
 - Default claim: the current directory; override with
@@ -73,38 +100,22 @@ shortleash run --fleet --budget 3 -- claude -p "refactor the api layer"
 - **Conflict = warning, never a block.** If another agent holds an
   overlapping path, you get a loud stderr warning and the run proceeds
   anyway — a lock must never be a deadlock.
-- Released automatically on exit (normal, signal, or crash via the TTL
-  backstop). Tune with `--fleet-owner "dan"` and `--fleet-ttl 3600`.
+- Released automatically on exit (normal, Ctrl-C/SIGTERM, or crash via the
+  TTL backstop). Tune with `--fleet-owner "dan"` and `--fleet-ttl 3600`.
+- `shortleash fleet list` shows who holds what right now.
 
-### Prompt cache optimizer
-
-Stop the bleed *and* shrink the bill. Prompt caching discounts repeated
-prefix tokens (up to 90% off) — but only when stable content sits first
-and per-request variables sit last:
-
-```bash
-shortleash cache guide                  # provider docs + the core rule
-shortleash cache check -i prompt.txt    # how cacheable is this prompt?
-shortleash cache make -i prompt.txt -o prompt.cached.txt --provider anthropic
-```
-
-`cache make` restructures your `{{variable}}`-templated prompt into
-cache-optimal layout and emits integration snippets for Anthropic (explicit
-`cache_control` breakpoints), OpenAI/DeepSeek (automatic prefix caching),
-and Gemini (explicit context caching).
-
-When wrapping `claude`, `--output-format stream-json --verbose` are added
-automatically (the guard needs the telemetry stream). The agent's stdout
-passes through untouched, so you still watch it work.
+### Killing the tree
 
 On breach the **whole process tree** is killed. On POSIX the child runs in
 its own process group (`start_new_session`): SIGTERM, then SIGKILL after
 `--grace-period` (default 5s). On Windows the child is placed in a
-kill-on-close **Job Object** the moment it starts, so everything it spawns
-is in the job too and one `TerminateJobObject` ends the tree — orphans
-whose parent already exited included (no SIGTERM there, so the grace
-period does not apply to the kill itself). If the job cannot be set up,
-the fallback is `taskkill /T /F` plus an orphan sweep by parent pid.
+kill-on-close **Job Object** immediately after launch, so everything it
+spawns from then on is in the job too and one `TerminateJobObject` ends the
+tree — orphans whose parent already exited included (no SIGTERM there, so
+the grace period does not apply to the kill itself). A grandchild spawned
+in the instant between `CreateProcess` and the job assignment is not
+covered. If the job cannot be set up, the fallback is `taskkill /T /F` plus
+an orphan sweep by parent pid.
 
 Children that outlive the command are handled too. If the agent exits but
 leaves subprocesses running (which also keep its output pipe open), the
@@ -113,10 +124,17 @@ stragglers by process group and says so in the receipt — it never hangs on
 them. A grandchild that detached into its own session is out of reach by
 design; the receipt warns about it instead of waiting forever.
 
-Exit codes: `124` on a guard kill; `125` when a budget/token/spawn/anomaly
-cap was requested but the child produced **no usage telemetry** (the cap
-could not have been enforced — see *Trust boundary*); otherwise the child's
-exit code.
+### Exit codes
+
+| code | meaning |
+|---|---|
+| `124` | a cap tripped and the tree was killed (mirrors `timeout(1)`) |
+| `125` | a budget/token/spawn/anomaly cap was requested but the child produced **no usage telemetry** — the cap could not have been enforced (see *Trust boundary*) |
+| `130` / `143` | the leash itself got Ctrl-C / SIGTERM; tree killed, receipt written |
+| `1` | the process exited 0 but its final stream-json `result` said `is_error: true` (`FAILED:` in the receipt, e.g. "Not logged in") |
+| `128+N` | the child was killed by signal N outside any breach (what a shell would report) |
+| `2` | usage error, command not found, unsafe `.cmd` launch refused |
+| other | the child's own exit code |
 
 ## The receipt
 
@@ -137,7 +155,20 @@ Mid-run cost is estimated from a fallback pricing table (clearly marked);
 the final receipt prefers the agent-reported `total_cost_usd` when the run
 completes. The receipt JSON also carries `telemetry_seen`, `usage_events`,
 `enforced` / `not_enforced` (which caps actually held), `pricing`
-(`as_of`, `source`) and `warnings` (e.g. stray child processes).
+(`as_of`, `source`), `agent_error` (the `is_error` verdict), `hint` and
+`warnings` (stray child processes, a closed stdout, corrupt history lines).
+
+### What the receipt stores about your command
+
+`command` is the wrapped argv with **secret-looking values redacted**: the
+value after any flag whose name contains `key`, `token`, `secret`,
+`password` or `passwd` (`--api-key sk-…`, `--token=…`, `DB_PASSWORD=…`)
+becomes `***`. **The prompt is not a secret by that rule and is stored
+verbatim** — `-p "my password is hunter2"` ends up in `receipt.json` as
+typed. Pass `--redact-prompt` to replace the argument after `-p`,
+`--print` or `--prompt` (and a `--prompt=…` value) with `<redacted>`; a
+prompt given any other way (bare positional, stdin, a file) is not
+recognised. The history file never stores command text.
 
 ### Prices are a hard-coded fallback — verify them
 
@@ -182,10 +213,39 @@ but the cap you asked for never held), the cost is `null` rather than
   `taskkill /T /F` as the fallback; see `proctree.py`) — a kill takes the
   whole tree, never your shell.
 - A monitor thread parses each stream-json line (`system/init`,
-  `assistant` usage + `Task` tool_use spawns, `result` cost) and checks caps
-  after every observation.
+  `assistant` usage + subagent `tool_use` spawns, `result` cost/`is_error`)
+  and checks caps after every observation.
+- Claude Code emits **one `assistant` event per content block**, all with
+  the same `message.id` and the same `usage` (its docs say so). Usage is
+  counted once per message id — a block that arrives with a larger
+  `output_tokens` tops the count up, it is never added twice — so the
+  budget trips on real spend, not on duplicates. Events without a message
+  id (other emitters) are each counted.
+- Subagent spawns are counted from `tool_use` blocks named `Agent`
+  (current Claude Code) or `Task` (older versions), once per block id.
+  Subagents' own messages are in the stream too and their usage counts —
+  it is real spend.
 - A watchdog thread enforces `--timeout` even if the child goes silent.
-- Subagent spawns are counted from `Task` tool_use blocks in the stream.
+
+## Windows
+
+- `claude` from npm is a `claude.cmd` shim, and Windows runs `.cmd`/`.bat`
+  files through **cmd.exe**, which re-parses the command line: `%VAR%` is
+  expanded, `^` is eaten, an embedded `"` can let `&`, `|`, `<`, `>` run
+  other commands (the BatBadBut class of argument injection) — a prompt
+  taken from a file or a ticket is exactly that kind of text. The leash
+  therefore reads the npm shim and launches what it would launch,
+  `node …\node_modules\@anthropic-ai\claude-code\cli.js`, directly, with no
+  cmd.exe in between. Any other `.cmd`/`.bat` target is refused (exit `2`,
+  clear message) when an argument contains `"`, `%`, `!`, `^`, `&`, `|`,
+  `<`, `>` or a newline; plain arguments still run as before. A `claude.exe`
+  (native installer) needs none of this.
+- The child is started with `CREATE_NEW_PROCESS_GROUP`, which makes it
+  **ignore console Ctrl-C** — so the leash handles Ctrl-C itself and kills
+  the Job (see *Stopping the leash*). The leash's wait is polled in short
+  slices so Ctrl-C is noticed promptly on Windows too.
+- If the leash dies hard (task manager), the kill-on-close Job Object
+  takes the agent down with it.
 
 ## Trust boundary
 
@@ -211,6 +271,24 @@ Be honest about what the guard can and can't see:
 Treat this as a guardrail against runaway cost, not a security boundary
 against an adversarial agent.
 
+## Prompt cache optimizer (`shortleash cache`) — a separate helper
+
+This lives in the package but has nothing to do with the leash, the
+receipt or the history; it may move to its own package later. Prompt
+caching discounts repeated prefix tokens (up to 90% off) — but only when
+stable content sits first and per-request variables sit last:
+
+```bash
+shortleash cache guide                  # provider docs + the core rule
+shortleash cache check -i prompt.txt    # how cacheable is this prompt?
+shortleash cache make -i prompt.txt -o prompt.cached.txt --provider anthropic
+```
+
+`cache make` restructures your `{{variable}}`-templated prompt into
+cache-optimal layout and emits integration snippets for Anthropic (explicit
+`cache_control` breakpoints), OpenAI/DeepSeek (automatic prefix caching),
+and Gemini (explicit context caching).
+
 ## Testing
 
 ```bash
@@ -220,9 +298,11 @@ python3 -m unittest discover -s tests -v   # or: python3 -m pytest -q
 `sim/runaway.py` is a fake agent emitting realistic stream-json — the suite
 kills it for real (budget, spawn, token, and timeout breaches) without
 spending a cent. It also spawns escaped grandchildren to prove the leash
-returns and kills the whole tree, and it never touches your real
+returns and kills the whole tree, sends the leash itself Ctrl-C and SIGTERM
+(POSIX), closes its stdout mid-run, and never touches your real
 `~/.shortleash` (state lives under `SHORTLEASH_HOME`, which the tests point
-at a temp dir).
+at a temp dir). The Windows shim resolution and the cmd.exe refusal list
+are unit-tested with a fake shim directory on every platform.
 
 ## Scope / limits (v0.1.0)
 
