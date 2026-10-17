@@ -1,14 +1,19 @@
 """Fleet tests (merged from claimlock): temp DBs, real CLI runs."""
 
-import io
+import _isolate  # noqa: F401  (isolate ~/.shortleash before importing)
+
 import os
+import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
 
 from shortleash import cli as cli_mod
 from shortleash import fleet as fleet_mod
+from shortleash import paths as paths_mod
 from test_cli import capture_stderr_fd
+
+# A no-op command that exists on every platform (`true` does not on Windows).
+NOOP = [sys.executable, "-c", "pass"]
 
 
 def tmpdb() -> str:
@@ -61,7 +66,7 @@ class TestFleetCLI(unittest.TestCase):
     def test_fleet_claim_and_release(self):
         d = tempfile.mkdtemp()
         code, err = self._run("run", "--fleet", "--claim", d, "--no-anomaly",
-                              "--", "true")
+                              "--", *NOOP)
         self.assertEqual(code, 0)
         self.assertIn("fleet claim", err)
         # released after the run
@@ -73,17 +78,28 @@ class TestFleetCLI(unittest.TestCase):
         conn = fleet_mod.connect(self.db)
         fleet_mod.claim(conn, [d], owner="other-agent", ttl=600)
         code, err = self._run("run", "--fleet", "--claim", d, "--no-anomaly",
-                              "--", "true")
+                              "--", *NOOP)
         self.assertEqual(code, 0)  # not blocked
         self.assertIn("WARNING", err)
         self.assertIn("other-agent", err)
 
     def test_fleet_default_claims_cwd(self):
-        code, err = self._run("run", "--fleet", "--no-anomaly", "--", "true")
+        code, err = self._run("run", "--fleet", "--no-anomaly", "--", *NOOP)
         self.assertEqual(code, 0)
         self.assertIn("fleet claim", err)
         conn = fleet_mod.connect(self.db)
         self.assertEqual(fleet_mod.active_claims(conn), [])
+
+    def test_default_db_lives_under_shortleash_home(self):
+        # No DB_PATH override: the DB comes from $SHORTLEASH_HOME (which the
+        # test harness points at a temp dir), never the real ~/.shortleash.
+        fleet_mod.DB_PATH = None
+        expected = os.path.join(os.environ["SHORTLEASH_HOME"], "fleet.db")
+        self.assertEqual(paths_mod.fleet_db_path(), expected)
+        conn = fleet_mod.connect()
+        conn.close()
+        self.assertTrue(os.path.isfile(expected))
+        self.assertTrue(expected.startswith(os.environ["SHORTLEASH_HOME"]))
 
 
 if __name__ == "__main__":

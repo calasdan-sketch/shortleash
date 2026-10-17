@@ -17,7 +17,12 @@ import sqlite3
 import time
 import uuid
 
-DB_PATH = os.path.expanduser("~/.shortleash/fleet.db")
+from . import paths
+
+#: Explicit override hook for the DB location (tests, embedding). When
+#: None, the path comes from paths.fleet_db_path() — i.e. ~/.shortleash
+#: or $SHORTLEASH_HOME — resolved at connect() time.
+DB_PATH: str | None = None
 DEFAULT_TTL = 1800  # 30 minutes
 MAX_TTL = 86400  # 24 hours
 
@@ -38,10 +43,11 @@ CREATE INDEX IF NOT EXISTS idx_claims_cid ON claims(claim_id);
 
 
 def connect(db_path: str | None = None) -> sqlite3.Connection:
-    # NB: read DB_PATH at call time, not as a default arg — a default arg
-    # would bind the original value at import and ignore later reassignment.
+    # NB: resolve the path at call time, not as a default arg — a default
+    # arg would bind the value at import and ignore $SHORTLEASH_HOME or a
+    # later DB_PATH reassignment.
     if db_path is None:
-        db_path = DB_PATH
+        db_path = DB_PATH or paths.fleet_db_path()
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=5.0)
     conn.executescript(SCHEMA)

@@ -17,12 +17,18 @@ import json
 import os
 import statistics
 
-DEFAULT_HISTORY_PATH = os.path.expanduser("~/.shortleash/history.jsonl")
+from . import paths
+
 MIN_HISTORY = 5
 
 
+def default_history_path() -> str:
+    """~/.shortleash/history.jsonl, or under $SHORTLEASH_HOME (see paths)."""
+    return paths.history_path()
+
+
 def record(receipt: dict, path: str | None = None) -> None:
-    path = path or DEFAULT_HISTORY_PATH
+    path = path or default_history_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     entry = {
         "agent": receipt.get("agent", ""),
@@ -32,7 +38,7 @@ def record(receipt: dict, path: str | None = None) -> None:
         "breached": receipt.get("breached", False),
         "ended_at": receipt.get("ended_at", ""),
     }
-    with open(path, "a") as f:
+    with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
 
@@ -46,14 +52,14 @@ def baseline(agent: str, profile: str = "",
     """Return {median_cost, median_tokens, runs} or None if not enough
     history. Breached runs are excluded — they were, by definition,
     not normal."""
-    path = path or DEFAULT_HISTORY_PATH
+    path = path or default_history_path()
     if not os.path.isfile(path):
         return None
     want = profile or agent
     costs: list[float] = []
     tokens: list[int] = []
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:

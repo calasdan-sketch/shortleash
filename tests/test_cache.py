@@ -106,7 +106,7 @@ class TestCLI(unittest.TestCase):
     def _prompt(self, text: str) -> str:
         tmp = tempfile.mkdtemp()
         p = os.path.join(tmp, "p.txt")
-        with open(p, "w") as f:
+        with open(p, "w", encoding="utf-8") as f:
             f.write(text)
         return p
 
@@ -143,7 +143,7 @@ class TestCLI(unittest.TestCase):
         with redirect_stdout(buf):
             code = cli_mod.main(["cache", "make", "-i", p, "-o", outp])
         self.assertEqual(code, 0)
-        with open(outp) as f:
+        with open(outp, encoding="utf-8") as f:
             content = f.read()
         self.assertIn("{{q}}", content)
         self.assertIn("Rules.", content)

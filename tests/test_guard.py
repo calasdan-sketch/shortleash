@@ -5,6 +5,8 @@ sim/runaway.py, which emits Claude Code stream-json without spending
 a cent.
 """
 
+import _isolate  # noqa: F401  (isolate ~/.shortleash before importing)
+
 import json
 import io
 import os
@@ -36,7 +38,7 @@ class TestGuard(unittest.TestCase):
         guard.history_path = os.path.join(tmpdir, "h.jsonl")
         try:
             code = guard.run(sim_cmd(*args))
-            with open(receipt_path) as f:
+            with open(receipt_path, encoding="utf-8") as f:
                 rec = json.load(f)
             return code, rec
         finally:

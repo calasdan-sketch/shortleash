@@ -1,11 +1,14 @@
 """CLI-level tests: secrets redaction, clean errors, quick-start commands."""
 
+import _isolate  # noqa: F401  (isolate ~/.shortleash before importing)
+
 import contextlib
 import io
 import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -23,23 +26,43 @@ def capture_stderr_fd():
 
     redirect_stderr alone breaks subprocess.Popen(stderr=sys.stderr)
     because a StringIO has no fileno — this dup2's fd 2 into a pipe.
+    sys.stderr is rebound to that same pipe for the duration: under
+    pytest it is a capture object that bypasses fd 2 entirely, and
+    without this the Python-level writes would never reach the pipe.
+    A reader thread drains the pipe so a chatty child can never fill
+    the (small, on Windows) pipe buffer and deadlock.
     Yields a list of byte chunks; join and decode to inspect.
     """
     r, w = os.pipe()
-    saved = os.dup(2)
+    saved_fd = os.dup(2)
     os.dup2(w, 2)
     os.close(w)
+    saved_stream = sys.stderr
+    stream = open(os.dup(2), "w", encoding="utf-8", errors="replace",
+                  closefd=True)
     chunks: list[bytes] = []
-    try:
-        yield chunks
-    finally:
-        os.dup2(saved, 2)
-        os.close(saved)
+
+    def _drain() -> None:
         while True:
             data = os.read(r, 65536)
             if not data:
                 break
             chunks.append(data)
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+    sys.stderr = stream
+    try:
+        yield chunks
+    finally:
+        sys.stderr = saved_stream
+        try:
+            stream.close()
+        except OSError:
+            pass
+        os.dup2(saved_fd, 2)
+        os.close(saved_fd)
+        reader.join(timeout=10)
         os.close(r)
 
 
@@ -116,7 +139,7 @@ class TestSecretsEndToEnd(unittest.TestCase):
         stderr_text = b"".join(chunks).decode("utf-8", "replace")
         self.assertNotIn("sk-secret123", stderr_text,
                          "secret leaked into stderr")
-        with open(receipt_path) as f:
+        with open(receipt_path, encoding="utf-8") as f:
             blob = f.read()
         self.assertNotIn("sk-secret123", blob,
                          "secret leaked into receipt JSON")
@@ -167,7 +190,7 @@ class TestQuickStartCommands(unittest.TestCase):
 
     def _prompt(self, text: str) -> str:
         p = os.path.join(tempfile.mkdtemp(), "p.txt")
-        with open(p, "w") as f:
+        with open(p, "w", encoding="utf-8") as f:
             f.write(text)
         return p
 
@@ -185,6 +208,21 @@ class TestQuickStartCommands(unittest.TestCase):
         p = self._prompt("You are {{role}}. Go.")
         with redirect_stdout(io.StringIO()):
             self.assertEqual(cli_mod.main(["cache", "check", "-i", p]), 0)
+
+    def test_non_ascii_output_survives_cp1252_console(self):
+        # Windows consoles often run cp1252 with errors="strict"; the ✓ in
+        # the verdict used to raise UnicodeEncodeError. main() hardens the
+        # streams so the character is replaced instead.
+        p = self._prompt("Static prompt, fully cacheable.")
+        raw = io.BytesIO()
+        strict = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+        with redirect_stdout(strict):
+            code = cli_mod.main(["cache", "check", "-i", p])
+            strict.flush()
+        self.assertEqual(code, 0)
+        text = raw.getvalue().decode("cp1252")
+        self.assertIn("fully cacheable already", text)
+        self.assertNotIn("✓", text)  # replaced, not crashed
 
     def test_cache_make_all_providers(self):
         p = self._prompt("Rules. Q: {{q}}")

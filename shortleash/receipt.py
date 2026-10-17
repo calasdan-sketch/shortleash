@@ -67,7 +67,7 @@ def build_receipt(
     ended_at: float,
     breached: bool,
     breach_reason: str | None,
-    cost_usd: float,
+    cost_usd: float | None,
     cost_estimated: bool,
     usage: dict,
     num_turns: int,
@@ -78,6 +78,12 @@ def build_receipt(
     agent: str = "",
     profile: str = "",
     baseline: dict | None = None,
+    telemetry_seen: bool = True,
+    usage_events: int = 0,
+    enforced: list[str] | None = None,
+    not_enforced: list[str] | None = None,
+    pricing: dict | None = None,
+    warnings: list[str] | None = None,
 ) -> dict:
     return {
         "tool": "shortleash",
@@ -92,7 +98,9 @@ def build_receipt(
         "duration_s": round(ended_at - started_at, 2),
         "breached": breached,
         "breach_reason": breach_reason,
-        "cost_usd": round(cost_usd, 6),
+        # None when the child produced no usage telemetry: there is no
+        # cost figure, estimated or otherwise — $0.00 would be a lie.
+        "cost_usd": None if cost_usd is None else round(cost_usd, 6),
         "cost_estimated": cost_estimated,
         "tokens": {
             "input": usage.get("input", 0),
@@ -105,27 +113,69 @@ def build_receipt(
         "exit_code": exit_code,
         "model": model,
         "session_id": session_id,
+        # Trust boundary, made explicit: which caps actually held.
+        "telemetry_seen": telemetry_seen,
+        "usage_events": usage_events,
+        "enforced": list(enforced or []),
+        "not_enforced": list(not_enforced or []),
+        "pricing": pricing,
+        "warnings": list(warnings or []),
     }
+
+
+NO_TELEMETRY_MSG = "no usage data seen"
+
+
+def no_telemetry_line(receipt: dict) -> str:
+    """The honest one-liner for a run whose child sent no usage events."""
+    enforced = receipt.get("enforced") or []
+    missing = receipt.get("not_enforced") or []
+    if "timeout" in enforced:
+        line = (f"{NO_TELEMETRY_MSG} — only the wall-clock/time limit "
+                f"was enforced")
+    else:
+        line = (f"{NO_TELEMETRY_MSG} — no wall-clock/time limit was set "
+                f"either, so nothing was enforced")
+    if missing:
+        line += f"; NOT enforced: {', '.join(missing)}"
+    return line
 
 
 def format_human(receipt: dict) -> str:
     t = receipt["tokens"]
     total_tokens = t["input"] + t["output"] + t["cache_write"] + t["cache_read"]
+    telemetry = receipt.get("telemetry_seen", True)
+    if receipt["cost_usd"] is None or not telemetry:
+        cost_line = f"  cost:      n/a ({NO_TELEMETRY_MSG})"
+    else:
+        cost_line = (f"  cost:      ${receipt['cost_usd']:.4f}"
+                     + (" (estimated)" if receipt["cost_estimated"]
+                        else " (reported)"))
     lines = [
         "",
         "── shortleash receipt ──────────────────────",
-        f"  cost:      ${receipt['cost_usd']:.4f}"
-        + (" (estimated)" if receipt["cost_estimated"] else " (reported)"),
+        cost_line,
         f"  tokens:    {total_tokens:,} "
         f"(in={t['input']:,} out={t['output']:,} "
         f"cache_r={t['cache_read']:,} cache_w={t['cache_write']:,})",
         f"  turns:     {receipt['num_turns']}   spawns: {receipt['subagent_spawns']}",
         f"  duration:  {receipt['duration_s']}s   exit: {receipt['exit_code']}",
     ]
+    pricing = receipt.get("pricing")
+    if pricing and telemetry and receipt.get("cost_estimated", True):
+        lines.append(f"  pricing:   {pricing.get('source', 'table')} as of "
+                     f"{pricing.get('as_of', '?')} — verify against "
+                     f"provider pricing")
     if receipt["breached"]:
         lines.append(f"  STOPPED:   {receipt['breach_reason']}")
+    elif not telemetry:
+        # Never print the green tick here: a cost cap cannot have held
+        # when the child never reported any usage.
+        lines.append(f"  WARNING:   {no_telemetry_line(receipt)}")
     else:
         lines.append("  finished within guardrails ✓")
+    for w in receipt.get("warnings") or []:
+        lines.append(f"  warning:   {w}")
     baseline = receipt.get("baseline")
     if baseline:
         lines.append(f"  baseline:  typical ${baseline['median_cost']:.4f} / "
@@ -136,5 +186,5 @@ def format_human(receipt: dict) -> str:
 
 
 def write_receipt(receipt: dict, path: str) -> None:
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(receipt, f, indent=2)

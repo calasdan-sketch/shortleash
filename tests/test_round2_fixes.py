@@ -10,6 +10,8 @@
   shortleash.__version__ == pyproject == receipt version. Plus --version.
 """
 
+import _isolate  # noqa: F401  (isolate ~/.shortleash before importing)
+
 import io
 import json
 import os
@@ -73,7 +75,7 @@ class TestMalformedTelemetryFailClosed(unittest.TestCase):
                 pass
         self.assertEqual(code, BREACH_EXIT_CODE,
                          "malformed telemetry must trip with exit 124")
-        with open(receipt_path) as f:
+        with open(receipt_path, encoding="utf-8") as f:
             rec = json.load(f)
         self.assertTrue(rec["breached"], "receipt must record the trip")
         self.assertIn("malformed", (rec["breach_reason"] or "").lower(),

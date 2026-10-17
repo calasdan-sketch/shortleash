@@ -11,5 +11,11 @@ requires-python = ">=3.10"
 
 [tool.setuptools.dynamic]
 version = {attr = "shortleash.__version__"}
+
+[tool.setuptools]
+# Explicit: the flat layout also holds sim/ and tests/, which setuptools'
+# auto-discovery otherwise refuses ("Multiple top-level packages").
+packages = ["shortleash"]
+
 [project.scripts]
 shortleash = "shortleash.cli:main"

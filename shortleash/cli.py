@@ -18,6 +18,21 @@ from . import pricing
 from . import __version__
 
 
+def _harden_streams() -> None:
+    """Never crash on a console that cannot encode the receipt or the
+    agent's output (Windows cp1252 consoles, piped output under odd
+    locales). Python's stderr already replaces unencodable characters;
+    make stdout do the same instead of raising UnicodeEncodeError."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None or getattr(stream, "errors", None) != "strict":
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="shortleash",
@@ -40,9 +55,15 @@ def _build_parser() -> argparse.ArgumentParser:
     r.add_argument("--timeout", type=float, default=None,
                    help="Max wall-clock seconds before the run is killed.")
     r.add_argument("--grace-period", type=float, default=5.0,
-                   help="Seconds between SIGTERM and SIGKILL on breach.")
+                   help="Seconds between SIGTERM and SIGKILL on breach "
+                        "(POSIX; Windows force-kills the tree at once), "
+                        "and how long to wait for stray child processes "
+                        "after the command exits.")
     r.add_argument("--pricing", type=str, default=None,
-                   help="JSON file overriding the fallback pricing table.")
+                   help="JSON file overriding the fallback pricing table "
+                        f"(or set ${pricing.PRICING_ENV}). The built-in "
+                        f"table is as of {pricing.PRICING_AS_OF} — verify "
+                        "against provider pricing.")
     r.add_argument("--receipt", type=str, default=None,
                    help="Write the per-run receipt JSON to this path.")
     r.add_argument("--quiet", action="store_true",
@@ -97,7 +118,7 @@ def _maybe_inject_stream_json(argv: list[str]) -> list[str]:
     """
     if not argv:
         return argv
-    prog = argv[0].split("/")[-1]
+    prog = guard_mod.agent_name(argv[0])
     if prog == "claude" and "--output-format" not in argv:
         return argv + ["--output-format", "stream-json", "--verbose"]
     return argv
@@ -151,6 +172,7 @@ def _cmd_cache(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _harden_streams()
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -175,11 +197,12 @@ def main(argv: list[str] | None = None) -> int:
         cmd = _maybe_inject_stream_json(cmd)
 
         try:
-            pricing_table = pricing.load_pricing(args.pricing)
+            pricing_table = pricing.load_table(args.pricing)
         except (OSError, ValueError) as e:
             # json.JSONDecodeError is a ValueError; never dump a traceback.
             print(f"shortleash: error: can't load pricing file "
-                  f"{args.pricing}: {e}", file=sys.stderr)
+                  f"{args.pricing or os.environ.get(pricing.PRICING_ENV)}: "
+                  f"{e}", file=sys.stderr)
             return 2
 
         g = guard_mod.Guard(
@@ -203,10 +226,11 @@ def main(argv: list[str] | None = None) -> int:
         if not args.quiet:
             # Never echo the full argv: it may contain secrets. Show only
             # the agent binary name alongside the caps.
-            agent_bin = cmd[0].split("/")[-1]
+            agent_bin = guard_mod.agent_name(cmd[0])
             sys.stderr.write(
                 f"[shortleash] guarding: {agent_bin}\n"
                 f"[shortleash] {' '.join(caps)}\n"
+                f"[shortleash] pricing: {pricing_table.describe()}\n"
             )
         if args.fleet:
             return _run_with_fleet(g, cmd, args)
@@ -222,7 +246,7 @@ def _run_with_fleet(g, cmd: list[str], args) -> int:
     conn = fleet_mod.connect()
     try:
         res = fleet_mod.claim(conn, paths, owner=args.fleet_owner,
-                              note=f"shortleash run: {cmd[0].split('/')[-1]}",
+                              note=f"shortleash run: {guard_mod.agent_name(cmd[0])}",
                               ttl=args.fleet_ttl)
     except ValueError as e:
         print(f"shortleash: fleet claim error: {e}", file=sys.stderr)

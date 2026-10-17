@@ -1,5 +1,7 @@
 """History baselines + anomaly detection tests."""
 
+import _isolate  # noqa: F401  (isolate ~/.shortleash before importing)
+
 import json
 import os
 import sys
@@ -7,12 +9,12 @@ import tempfile
 import unittest
 
 from shortleash import history as history_mod
-from shortleash.guard import Guard, BREACH_EXIT_CODE
+from shortleash.guard import Guard, BREACH_EXIT_CODE, agent_name
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SIM = os.path.join(REPO, "sim", "runaway.py")
 PY = sys.executable
-AGENT = os.path.basename(PY)  # what Guard derives from argv[0]
+AGENT = agent_name(PY)  # what Guard derives from argv[0] (no .exe on Windows)
 
 
 def seed_history(path: str, agent: str, costs: list[float],
@@ -125,7 +127,7 @@ class TestAnomalyGuard(unittest.TestCase):
         hist = os.path.join(tmp, "h.jsonl")
         g = Guard(history_path=hist, quiet=True, min_history=100)
         g.run([PY, SIM, "--well-behaved"])
-        with open(hist) as f:
+        with open(hist, encoding="utf-8") as f:
             lines = [json.loads(l) for l in f if l.strip()]
         self.assertEqual(len(lines), 1)
         self.assertEqual(lines[0]["agent"], AGENT)

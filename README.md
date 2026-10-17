@@ -21,6 +21,10 @@ alias shortleash="python3 -m shortleash"
 pip install .
 ```
 
+Works on Linux, macOS and Windows 11 (Python 3.10+). On Windows, `claude`
+is found through `PATHEXT` (the npm `claude.cmd` shim), and console output
+never dies on a cp1252 code page — unencodable characters are replaced.
+
 ## Usage
 
 ```bash
@@ -37,8 +41,8 @@ shortleash run --budget 5.00 --max-spawns 10 --max-tokens 500000 \
 ### Anomaly mode (the smart default)
 
 Static caps punish legitimate big tasks. Anomaly mode learns instead:
-every receipt is appended to `~/.shortleash/history.jsonl`, and once an
-agent has 5+ past runs, the guard trips only when the live run exceeds
+every receipt is appended to `~/.shortleash/history.jsonl` (or under
+`$SHORTLEASH_HOME`), and once an agent has 5+ past runs, the guard trips only when the live run exceeds
 **3× the historical median** cost or tokens for that agent.
 
 ```bash
@@ -93,9 +97,26 @@ When wrapping `claude`, `--output-format stream-json --verbose` are added
 automatically (the guard needs the telemetry stream). The agent's stdout
 passes through untouched, so you still watch it work.
 
-On breach the whole process tree gets SIGTERM, then SIGKILL after
-`--grace-period` (default 5s). Exit code is `124` on a guard kill, otherwise
-the child's exit code.
+On breach the **whole process tree** is killed. On POSIX the child runs in
+its own process group (`start_new_session`): SIGTERM, then SIGKILL after
+`--grace-period` (default 5s). On Windows the child is placed in a
+kill-on-close **Job Object** the moment it starts, so everything it spawns
+is in the job too and one `TerminateJobObject` ends the tree — orphans
+whose parent already exited included (no SIGTERM there, so the grace
+period does not apply to the kill itself). If the job cannot be set up,
+the fallback is `taskkill /T /F` plus an orphan sweep by parent pid.
+
+Children that outlive the command are handled too. If the agent exits but
+leaves subprocesses running (which also keep its output pipe open), the
+leash waits one grace period for the pipe to close, then kills the
+stragglers by process group and says so in the receipt — it never hangs on
+them. A grandchild that detached into its own session is out of reach by
+design; the receipt warns about it instead of waiting forever.
+
+Exit codes: `124` on a guard kill; `125` when a budget/token/spawn/anomaly
+cap was requested but the child produced **no usage telemetry** (the cap
+could not have been enforced — see *Trust boundary*); otherwise the child's
+exit code.
 
 ## The receipt
 
@@ -114,16 +135,52 @@ Every run ends with a receipt on stderr and optionally as JSON
 
 Mid-run cost is estimated from a fallback pricing table (clearly marked);
 the final receipt prefers the agent-reported `total_cost_usd` when the run
-completes. Override pricing with `--pricing pricing.json`:
+completes. The receipt JSON also carries `telemetry_seen`, `usage_events`,
+`enforced` / `not_enforced` (which caps actually held), `pricing`
+(`as_of`, `source`) and `warnings` (e.g. stray child processes).
+
+### Prices are a hard-coded fallback — verify them
+
+The built-in table (`pricing.py`, USD per 1M tokens) is **not fetched from
+anywhere**; it was written on the date in `PRICING_AS_OF` and is printed in
+the startup banner and the receipt as
+`pricing: built-in fallback table as of 2026-10-16 — verify against
+provider pricing`. Check it against the provider's pricing page before
+trusting a `--budget` to the cent, and override it with `--pricing
+pricing.json` or the `SHORTLEASH_PRICING` environment variable pointing at a
+JSON file:
 
 ```json
-{"sonnet": [3.0, 15.0], "opus": [15.0, 75.0], "haiku": [0.8, 4.0]}
+{"as_of": "2026-10-16",
+ "sonnet": [3.0, 15.0], "opus": [15.0, 75.0], "haiku": [0.8, 4.0]}
 ```
+
+`as_of` is optional metadata echoed in the receipt; every other key is a
+case-insensitive substring matched against the model name, mapped to
+`[input, output]` dollars per 1M tokens.
+
+### No telemetry, no comfort
+
+Wrap something that never emits stream-json usage events (a plain script,
+`claude` without `-p`, a different agent) and the guard has nothing to
+enforce a cost cap against. It says so instead of pretending:
+
+```
+  cost:      n/a (no usage data seen)
+  ...
+  WARNING:   no usage data seen — only the wall-clock/time limit was enforced; NOT enforced: budget
+```
+
+The exit code is `125` in that case (the run itself may have succeeded,
+but the cap you asked for never held), the cost is `null` rather than
+`$0.00`, and the run is not added to the anomaly history.
 
 ## How it works
 
-- Child runs in its own process group (`start_new_session=True`) — a kill
-  takes the whole tree, never your shell.
+- Child runs in its own process group on POSIX (`start_new_session=True`)
+  and in a kill-on-close Job Object on Windows (`kernel32` via ctypes,
+  `taskkill /T /F` as the fallback; see `proctree.py`) — a kill takes the
+  whole tree, never your shell.
 - A monitor thread parses each stream-json line (`system/init`,
   `assistant` usage + `Task` tool_use spawns, `result` cost) and checks caps
   after every observation.
@@ -144,6 +201,12 @@ Be honest about what the guard can and can't see:
   totals *down*, but it cannot see spend the child simply hides.
 - **Only `--timeout` is enforced independently of the child** — a
   wall-clock watchdog, immune to telemetry lies.
+- **No telemetry at all means no cost cap was enforced.** The receipt
+  then says `no usage data seen — only the wall-clock/time limit was
+  enforced`, lists the caps that were NOT enforced, reports the cost as
+  n/a, and exits `125` if such a cap was requested.
+- **Prices are a dated fallback table**, not live data: every receipt
+  prints its `as_of` date — verify against provider pricing.
 
 Treat this as a guardrail against runaway cost, not a security boundary
 against an adversarial agent.
@@ -151,12 +214,15 @@ against an adversarial agent.
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v   # or: python3 -m pytest -q
 ```
 
 `sim/runaway.py` is a fake agent emitting realistic stream-json — the suite
 kills it for real (budget, spawn, token, and timeout breaches) without
-spending a cent.
+spending a cent. It also spawns escaped grandchildren to prove the leash
+returns and kills the whole tree, and it never touches your real
+`~/.shortleash` (state lives under `SHORTLEASH_HOME`, which the tests point
+at a temp dir).
 
 ## Scope / limits (v0.1.0)
 
