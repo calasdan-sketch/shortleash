@@ -5,17 +5,25 @@ Design:
   on POSIX, CREATE_NEW_PROCESS_GROUP on Windows) so a breach kill takes
   the whole tree, never our own group.
 - A monitor thread reads the child's stdout line-by-line, parses
-  stream-json events, passes every line through to our stdout
-  (so the user still watches the agent work), and checks caps after
-  each observation. If our stdout goes away (`| head -1`), echoing stops
-  and parsing continues -- the caps still hold.
+  stream-json events and checks caps after each observation; it hands
+  every line to an echo thread (_EchoPump) that passes it through to our
+  stdout, so the user still watches the agent work. Parsing never waits
+  for the echo: a reader of OUR stdout that stalls (a paused pager, a
+  full pipe) must not blind the caps, so the hand-over is a bounded queue
+  that drops lines (and says so) rather than block. If our stdout goes
+  away (`| head -1`), echoing stops and parsing continues -- the caps
+  still hold.
 - On breach: kill the whole tree (SIGTERM, grace period, SIGKILL on
   POSIX; Job Object / taskkill /T /F on Windows).
 - A watchdog thread enforces --timeout even when the child goes silent.
-- Ctrl-C / SIGTERM to the leash: the child is in its own process group
-  (and, on Windows, ignores console Ctrl-C), so the signal reaches only
-  us. We kill the tree, write the receipt and exit 130 (Ctrl-C) or 143
-  (SIGTERM) -- never die with a traceback leaving the agent running.
+- Ctrl-C / SIGTERM / SIGHUP / SIGQUIT to the leash: the child is in its
+  own session (and, on Windows, ignores console Ctrl-C), so the signal
+  reaches only us -- a closed terminal or a dropped SSH connection is a
+  SIGHUP to the leash and to nobody else. We kill the tree, write the
+  receipt and exit 128+N (130, 143, 129, 131) -- never die with a
+  traceback leaving the agent running. A signal the parent chose to ignore
+  (`nohup`) stays ignored. SIGKILL cannot be handled; on Linux the kernel
+  is asked to kill the direct child with the leash (proctree).
 - Escaped grandchildren: when the child exits but something it spawned
   still holds our stdout pipe open, the monitor would block forever and
   the leash would never return. After the child exits we wait at most
@@ -25,17 +33,28 @@ Design:
   content block, all carrying the same message id and the same usage.
   Usage is counted once per message id (growing fields are topped up,
   never added twice); spawns are counted once per tool_use block id.
-- Exit code 124 on guard-triggered kill (mirrors timeout(1)); 125 when
-  a telemetry-dependent cap was requested but the child never sent any
-  usage telemetry (the cap could not have been enforced); 130/143 on
-  Ctrl-C/SIGTERM; 1 when the agent's final result says is_error although
-  the process exited 0; a child killed by signal N outside a breach is
-  128+N like a shell; otherwise the child's exit code.
+- The agent's FINAL report (its stream-json `result` event) is compared
+  with every cap once the run has ended. A cap exceeded only in that
+  report could not be enforced live -- the money was already spent -- but
+  "finished within guardrails" would be false, so it is a breach, found
+  after the fact: the receipt says so (`breach_live: false`, EXCEEDED
+  instead of STOPPED) and each cap's `enforced_live` says whether it
+  could have stopped the run while it ran or was only checked afterwards.
+- Exit code 126 when the command exists but cannot be started (no
+  receipt), 2 when it is not found; 124 on guard-triggered kill (mirrors
+  timeout(1)) and when a cap was found exceeded only after the fact; 125 when a
+  telemetry-dependent cap was requested but there was nothing to enforce
+  it against (no usage telemetry at all, or -- for the spawn cap -- no
+  per-message events); 130/143 on Ctrl-C/SIGTERM; 1 when the agent's
+  final result says is_error although the process exited 0; a child
+  killed by signal N outside a breach is 128+N like a shell; otherwise
+  the child's exit code.
 """
 
 from __future__ import annotations
 
 import collections
+import math
 import os
 import signal
 import subprocess
@@ -54,10 +73,24 @@ BREACH_EXIT_CODE = 124
 #: A budget/token/spawn/anomaly cap was requested, but the child sent no
 #: usage telemetry, so only the wall-clock limit (if any) was enforced.
 NO_TELEMETRY_EXIT_CODE = 125
+#: The command exists but could not be started (a directory, no execute
+#: permission, not an executable format): the shell's own "found but not
+#: executable". Nothing ran, so there is no receipt.
+CANNOT_START_EXIT_CODE = 126
 #: The leash itself was interrupted (Ctrl-C) / terminated (SIGTERM); the
 #: tree was killed and a receipt written. 128 + signal, like a shell.
 INTERRUPTED_EXIT_CODE = 130
 TERMINATED_EXIT_CODE = 143
+#: Every signal the leash turns into "kill the tree, write the receipt":
+#: 128 + the signal number, like a shell. SIGHUP (terminal closed, SSH
+#: dropped) and SIGQUIT (Ctrl-\) are treated like SIGTERM -- the agent is in
+#: its own session and would otherwise run on, uncapped, with nobody
+#: watching. SIGBREAK (Windows Ctrl-Break) has no number there and keeps the
+#: SIGTERM code. Names the platform lacks are simply never installed.
+SIGNAL_EXIT_CODES = {"SIGINT": INTERRUPTED_EXIT_CODE,
+                     "SIGTERM": TERMINATED_EXIT_CODE,
+                     "SIGHUP": 129, "SIGQUIT": 131,
+                     "SIGBREAK": TERMINATED_EXIT_CODE}
 #: The process exited 0 but its stream-json result said is_error.
 AGENT_ERROR_EXIT_CODE = 1
 
@@ -66,10 +99,88 @@ ANOMALY_HINT = ("stopped by anomaly mode, so this run is NOT in the baseline "
                 "it finish and be recorded, or use --profile NAME for a "
                 "separate baseline")
 
+ANOMALY_HINT_AFTER = ("flagged by anomaly mode only after the run ended, so "
+                      "this run is NOT in the baseline: re-run without "
+                      "--anomaly to let it be recorded, or use --profile "
+                      "NAME for a separate baseline")
+
 _EXE_SUFFIXES = (".exe", ".cmd", ".bat", ".com", ".ps1")
 #: How many message ids to remember for usage de-duplication. The split
 #: events of one message are consecutive, so a small window is plenty.
 _MESSAGE_WINDOW = 256
+
+
+#: Most output (characters) that may wait to be echoed while our own stdout
+#: does not take it; beyond that lines are dropped, not waited for.
+ECHO_QUEUE_LIMIT = 4 * 1024 * 1024
+#: The end of a run waits for the echo thread to flush its queue for as long
+#: as lines keep going out, and gives up after this many seconds without one.
+ECHO_STALL_SECONDS = 2.0
+
+
+class _EchoPump:
+    """Passes the agent's output lines to ``write`` on a thread of its own.
+
+    The monitor thread must never wait for our stdout (a stalled reader
+    would blind every cap), so it only ``put``s lines here. The queue is
+    bounded: when it is full the line is counted in ``dropped`` and
+    discarded -- the echo is a convenience, the caps are the point."""
+
+    def __init__(self, write, limit: int = ECHO_QUEUE_LIMIT):
+        self._write = write
+        self._limit = limit
+        self._cond = threading.Condition()
+        self._lines: collections.deque[str] = collections.deque()
+        self._queued = 0
+        self._closed = False
+        self.dropped = 0
+        self.written = 0
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def put(self, line: str) -> None:
+        with self._cond:
+            if self._closed:
+                return
+            if self._lines and self._queued + len(line) > self._limit:
+                self.dropped += 1
+                return
+            self._lines.append(line)
+            self._queued += len(line)
+            self._cond.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while not self._lines and not self._closed:
+                    self._cond.wait()
+                if not self._lines:
+                    return
+                line = self._lines.popleft()
+                self._queued -= len(line)
+            self._write(line)  # may block for good: that is why we are a thread
+            self.written += 1
+
+    def pending(self) -> int:
+        with self._cond:
+            return len(self._lines)
+
+    def close(self, stall: float) -> bool:
+        """Stop taking lines and let the thread write out what is queued.
+        Waits as long as lines keep going out; gives up once ``stall``
+        seconds pass without one (a reader that has stopped reading).
+        True when everything went out."""
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+        seen, since = self.written, time.monotonic()
+        while self._thread.is_alive():
+            self._thread.join(0.05)
+            if self.written != seen:
+                seen, since = self.written, time.monotonic()
+            elif time.monotonic() - since >= stall:
+                return False
+        return True
 
 
 class _Terminated(BaseException):
@@ -110,6 +221,18 @@ def _child_stderr():
     except (AttributeError, OSError, ValueError):
         return None
     return sys.stderr
+
+
+def _say(text: str) -> None:
+    """Write to stderr, never raising: the terminal can be gone by now (a
+    SIGHUP means exactly that: EIO from the tty), and by this point the
+    verdict is in the receipt file and the exit code -- losing the summary
+    must not turn into a traceback."""
+    try:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+    except (OSError, ValueError, AttributeError):
+        pass
 
 
 def agent_name(argv0: str) -> str:
@@ -170,19 +293,28 @@ class Guard:
         self.spawns = 0
         self.num_turns = 0
         self.model = ""
+        self._price_notice_shown = False
         self.session_id = ""
         self.reported_cost: float | None = None
+        # The usage totals of the agent's final `result` event, or None when
+        # it gave none: checked against the caps once the run has ended.
+        self.reported_usage: dict | None = None
         self.usage_events = 0
         self.agent_error = False
         self.agent_error_text = ""
         self.breached = False
         self.breach_reason: str | None = None
-        self.interrupted_by: str | None = None  # "SIGINT" / "SIGTERM"
+        # True: the leash itself ended the run (a live check, the watchdog,
+        # a signal). False: the breach was only found after the run was
+        # over (the final report). None: no breach.
+        self.breach_live: bool | None = None
+        self.interrupted_by: str | None = None  # "SIGINT", "SIGHUP", ...
         self._in_wait = False     # a signal may unwind the current wait
         self._finishing = False   # receipt time: a signal only kills, never unwinds
         self._pending_signal: tuple[str, str] | None = None  # recorded, not raised
         self.escaped = False
         self.echo = True
+        self._pump: _EchoPump | None = None
         self.warnings: list[str] = []
         self.proc: subprocess.Popen | None = None
         self.job = None
@@ -238,7 +370,8 @@ class Guard:
     def telemetry_seen(self) -> bool:
         """True once the child has reported any usage or a final cost."""
         with self._lock:
-            return self.usage_events > 0 or self.reported_cost is not None
+            return (self.usage_events > 0 or self.reported_cost is not None
+                    or self.reported_usage is not None)
 
     def telemetry_caps(self) -> list[str]:
         """Caps that can only be enforced from the child's telemetry."""
@@ -253,7 +386,96 @@ class Guard:
             caps.append("anomaly")
         return caps
 
+    def cap_basis(self, cap: str) -> str | None:
+        """What a requested telemetry cap can be enforced against in this
+        run: "live" (per-message usage events arrived while it ran, so it
+        could stop the run), "final" (only the agent's final report, which
+        arrives when the run is over) or None (nothing at all)."""
+        with self._lock:
+            events = self.usage_events > 0
+            has_cost = self.reported_cost is not None
+            has_usage = self.reported_usage is not None
+        if events:
+            return "live"
+        if cap == "max_spawns":
+            return None  # only the per-message events list tool_use blocks
+        if cap == "max_tokens":
+            return "final" if has_usage else None
+        return "final" if (has_cost or has_usage) else None  # budget, anomaly
+
+    def _final_figures(self) -> dict:
+        """The run's totals now that it is over: our live count topped up
+        with the agent's final report (per field, the larger of the two).
+        ``cost`` is the agent's own figure when it gave one, else the
+        estimate from the final usage, else None (nothing was reported)."""
+        with self._lock:
+            live = dict(self.usage)
+            reported = (dict(self.reported_usage)
+                        if self.reported_usage is not None else None)
+            reported_cost = self.reported_cost
+            events = self.usage_events
+            model = self.model
+        usage = dict(live)
+        if reported is not None:
+            usage = {k: max(live[k], reported.get(k, 0)) for k in live}
+        have_data = events > 0 or reported_cost is not None or reported is not None
+        if reported_cost is not None:
+            cost: float | None = reported_cost
+        elif have_data:
+            cost = pricing.estimate_cost(model, usage, self.pricing_table)
+        else:
+            cost = None
+        return {
+            "usage": usage,
+            "tokens": sum(usage.values()),
+            "cost": cost,
+            "cost_reported": reported_cost is not None,
+            "live_cost": pricing.estimate_cost(model, live, self.pricing_table),
+            "live_tokens": sum(live.values()),
+            "usage_events": events,
+        }
+
     # -- breach checks ----------------------------------------------
+
+    def _final_reason(self) -> str | None:
+        """The run is over and no live check tripped: compare the agent's
+        FINAL report with every cap. Anything it exceeds could not be
+        stopped (it was already spent) but must not be called "within
+        guardrails" either: it is a breach, found after the fact."""
+        fig = self._final_figures()
+        cost, tokens = fig["cost"], fig["tokens"]
+        silent = ("no live usage events were seen, so nothing could be "
+                  "stopped while it ran")
+        if self.budget is not None and cost is not None and cost > self.budget:
+            src = ("reported by the agent" if fig["cost_reported"]
+                   else "estimated from its final usage report")
+            late = (f"the live estimate was ${fig['live_cost']:.4f}, under "
+                    f"the cap, so nothing was stopped"
+                    if fig["usage_events"] else silent)
+            return (f"budget exceeded after the fact: ${cost:.4f} {src} "
+                    f"> ${self.budget:.2f} cap ({late})")
+        if self.max_tokens is not None and tokens > self.max_tokens:
+            late = (f"the live count was {fig['live_tokens']:,}, under the "
+                    f"cap, so nothing was stopped"
+                    if fig["usage_events"] else silent)
+            return (f"token cap exceeded after the fact: {tokens:,} "
+                    f"> {self.max_tokens:,} max ({late})")
+        if self.anomaly is not None and self._baseline:
+            b = self._baseline
+            late = ("the live figures stayed under the limit, so nothing "
+                    "was stopped" if fig["usage_events"] else silent)
+            med_cost = b["median_cost"]
+            if cost is not None and med_cost > 0 and cost > med_cost * self.anomaly:
+                return (f"anomaly after the fact: ${cost:.4f} is "
+                        f"{cost / med_cost:.1f}x the typical "
+                        f"${med_cost:.4f} across {b['runs']} past runs "
+                        f"({late})")
+            med_toks = b["median_tokens"]
+            if med_toks > 0 and tokens > med_toks * self.anomaly:
+                return (f"anomaly after the fact: {tokens:,} tokens is "
+                        f"{tokens / med_toks:.1f}x the typical "
+                        f"{med_toks:,} across {b['runs']} past runs ({late})")
+        return None
 
     def _check_caps(self) -> str | None:
         """Return a breach reason, or None if within guardrails."""
@@ -298,6 +520,7 @@ class Guard:
                 return
             self.breached = True
             self.breach_reason = reason
+            self.breach_live = True
         self._kill_tree()
 
     # -- process control --------------------------------------------
@@ -345,7 +568,11 @@ class Guard:
     def _monitor_stdout(self) -> None:
         assert self.proc is not None and self.proc.stdout is not None
         for line in self.proc.stdout:
-            self._echo_line(line)
+            # Hand the line to the echo thread first (it never waits), then
+            # parse: nothing about our stdout may delay a cap check.
+            pump = self._pump
+            if pump is not None and self.echo:
+                pump.put(line)
             try:
                 # Trust boundary: the child is untrusted. Lines that are not
                 # JSON objects (warnings, entrypoint chatter, plain text) are
@@ -375,17 +602,29 @@ class Guard:
             with self._lock:
                 self.model = obs.get("model") or self.model
                 self.session_id = obs.get("session_id") or self.session_id
+            self._price_notice()
         elif kind == "usage":
             self._add_usage(obs)
             reason = self._check_caps()
             if reason:
                 self._trip(reason)
         elif kind == "result":
+            cost = None
+            if obs.get("cost_usd") is not None:
+                cost = float(obs["cost_usd"])  # TypeError/ValueError: fail closed
+                if not math.isfinite(cost):
+                    # inf / NaN would slip past every comparison (and max(0.0,
+                    # nan) is 0.0): never accept a figure that cannot be
+                    # compared with a cap.
+                    raise ValueError("total_cost_usd is not a finite number")
             with self._lock:
-                if obs.get("cost_usd") is not None:
+                if cost is not None:
                     # Child-reported cost: clamp to >= 0 for the same
                     # reason as usage (see _add_usage).
-                    self.reported_cost = max(0.0, float(obs["cost_usd"]))
+                    self.reported_cost = max(0.0, cost)
+                if obs.get("usage") is not None:
+                    self.reported_usage = {k: max(0, int(v)) for k, v
+                                           in obs["usage"].items()}
                 self.num_turns = obs.get("num_turns") or self.num_turns
                 if obs.get("session_id"):
                     self.session_id = obs["session_id"]
@@ -480,7 +719,8 @@ class Guard:
         return name, f"terminated ({name})"
 
     def _on_signal(self, signum, frame):
-        """Ctrl-C (SIGINT), SIGTERM and, on Windows, Ctrl-Break to the leash.
+        """Ctrl-C (SIGINT), SIGTERM, SIGHUP, SIGQUIT and, on Windows,
+        Ctrl-Break to the leash.
 
         Inside the child wait (or a kill's grace sleep) the signal unwinds
         that wait so run() handles it in one place: Ctrl-C as
@@ -505,15 +745,16 @@ class Guard:
             self._pending_signal = (which, label)
 
     def _install_handlers(self) -> list:
-        """Route SIGINT, SIGTERM (and SIGBREAK where it exists) through
-        _on_signal. Only the main thread may set handlers; elsewhere
+        """Route SIGINT, SIGTERM, SIGHUP, SIGQUIT (and SIGBREAK) -- those
+        that exist on this platform -- through _on_signal. Only the main
+        thread may set handlers; elsewhere
         (Guard.run in a worker thread) the default actions stand. A signal
         the parent set to be ignored stays ignored. Returns what to pass to
         _restore_handlers()."""
         previous = []
         if threading.current_thread() is not threading.main_thread():
             return previous
-        for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        for name in SIGNAL_EXIT_CODES:
             signum = getattr(signal, name, None)
             if signum is None:
                 continue
@@ -599,6 +840,7 @@ class Guard:
         with self._lock:
             if not self.breached:
                 self.breached = True
+                self.breach_live = True
                 if child_exited:
                     self.breach_reason = (
                         f"{label}: the leash was signalled after the command "
@@ -676,41 +918,56 @@ class Guard:
                     f"{self.receipt_path}: {e.strerror or e}\n")
                 sys.stderr.flush()
                 return 2
-        try:
-            self.proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=_child_stderr(),
-                # The agent streams UTF-8 JSON; never decode it with the
-                # console code page (cp1252) and never die on a bad byte.
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                **proctree.popen_kwargs(),
-            )
-        except FileNotFoundError:
-            # Clean error, exit 2 — no traceback, no receipt (no run happened).
-            sys.stderr.write(
-                f"shortleash: error: command not found: "
-                f"{argv[0] if argv else ''}\n")
-            sys.stderr.flush()
-            return 2
-        # Windows: the Job Object is what lets us kill grandchildren whose
-        # parent already exited (None elsewhere, or if it could not be set
-        # up -- then taskkill is the fallback).
-        self.job = proctree.attach_job(self.proc)
-        monitor = threading.Thread(target=self._monitor_stdout, daemon=True)
-        monitor.start()
-        watchdog = threading.Thread(target=self._watchdog, daemon=True)
-        watchdog.start()
-
-        # The handlers stay installed until the receipt is written and the
-        # run recorded: a signal in the straggler window (child gone, a
-        # grandchild still holding the pipe) used to find no handler
-        # (SIGTERM: silent death) or Python's default one (Ctrl-C:
-        # traceback out of monitor.join) — no receipt, stragglers running.
+        # The handlers are installed BEFORE the agent exists and stay
+        # installed until the receipt is written and the run recorded: a
+        # signal in the straggler window (child gone, a grandchild still
+        # holding the pipe) used to find no handler (SIGTERM: silent death)
+        # or Python's default one (Ctrl-C: traceback out of monitor.join),
+        # and one in the instant after launch killed the leash with the
+        # agent already running -- no receipt, nobody watching. A signal
+        # that arrives before the first wait is only recorded (see
+        # _wait_child) and acted on there.
         previous = self._install_handlers()
         try:
+            try:
+                self.proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=_child_stderr(),
+                    # The agent streams UTF-8 JSON; never decode it with the
+                    # console code page (cp1252) and never die on a bad byte.
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    **proctree.popen_kwargs(),
+                    **proctree.parent_death_kwargs(),
+                )
+            except FileNotFoundError:
+                # Clean error, exit 2 — no traceback, no receipt (no run
+                # happened).
+                sys.stderr.write(
+                    f"shortleash: error: command not found: "
+                    f"{argv[0] if argv else ''}\n")
+                sys.stderr.flush()
+                return 2
+            except OSError as e:
+                # It is there but cannot be started: a directory, no execute
+                # permission, not an executable format, a path through a
+                # file... Say so in one line and exit 126 like a shell --
+                # not a traceback and exit 1, which would read as "the
+                # agent failed". No run happened, so no receipt.
+                _say(f"shortleash: error: cannot start "
+                     f"{argv[0] if argv else ''}: {e.strerror or e}\n")
+                return CANNOT_START_EXIT_CODE
+            # Windows: the Job Object is what lets us kill grandchildren
+            # whose parent already exited (None elsewhere, or if it could
+            # not be set up -- then taskkill is the fallback).
+            self.job = proctree.attach_job(self.proc)
+            self._pump = _EchoPump(self._echo_line)
+            monitor = threading.Thread(target=self._monitor_stdout, daemon=True)
+            monitor.start()
+            watchdog = threading.Thread(target=self._watchdog, daemon=True)
+            watchdog.start()
             try:
                 exit_code = self._wait_child()
                 self._reap_stragglers(monitor)
@@ -723,6 +980,63 @@ class Guard:
             return self._finish(argv, wall_start, exit_code, monitor)
         finally:
             self._restore_handlers(previous)
+
+    def price_assumed(self) -> bool:
+        """True when the live estimate behind the caps had to assume a
+        rate: usage was priced, but no entry of the table names this model."""
+        with self._lock:
+            priced = self.usage_events > 0
+            model = self.model
+        return priced and pricing.match(model, self.pricing_table)[0] == "default"
+
+    def _price_assumption_text(self) -> str:
+        model = self.model
+        rate = pricing.match(model, self.pricing_table)[1]
+        who = f"model {model!r}" if model else "the model (the agent did not name one)"
+        return (f"{who} is not in the pricing table: the estimate behind "
+                f"the caps assumed the fallback rate "
+                f"${rate[0]:g} / ${rate[1]:g} per 1M tokens in / out -- "
+                f"check it, or add the model with --pricing FILE")
+
+    def _price_notice(self) -> None:
+        """Say once, as soon as the model is known, that its price is a
+        guess (the receipt repeats it)."""
+        if self._price_notice_shown or self.quiet:
+            return
+        if pricing.match(self.model, self.pricing_table)[0] == "default":
+            self._price_notice_shown = True
+            _say(f"[shortleash] warning: {self._price_assumption_text()}\n")
+
+    def _drain_echo(self) -> None:
+        """Let the echo thread write out what is queued, but never wait
+        long: a reader of our stdout that has stalled is not worth the
+        receipt. What could not be echoed is counted in a warning."""
+        pump, self._pump = self._pump, None
+        if pump is None:
+            return
+        done = pump.close(ECHO_STALL_SECONDS)
+        lost = pump.dropped + (0 if done else pump.pending())
+        if lost:
+            self.warnings.append(
+                f"the reader of our stdout was not keeping up: {lost} line(s) "
+                f"of the agent's output were not echoed (the caps were "
+                f"checked on every line regardless)")
+        if not done:
+            self._abandon_stdout()
+
+    @staticmethod
+    def _abandon_stdout() -> None:
+        """The echo thread is stuck inside a write to our stdout: the reader
+        has stopped reading. Interpreter shutdown flushes sys.stdout and
+        would wait for the buffer lock that thread holds, then abort with a
+        fatal error -- and the exit code would be lost. Point sys.stdout at
+        the null device so that last flush finds a free object (the stuck
+        write keeps the original alive; what it was writing is lost, and the
+        receipt says so)."""
+        try:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        except OSError:
+            pass
 
     def _finish(self, argv: list[str], wall_start: float,
                 exit_code: int | None, monitor: threading.Thread) -> int:
@@ -740,13 +1054,42 @@ class Guard:
                 pass
         # Closing a kill-on-close job ends anything still inside it.
         proctree.close_job(self.job)
-        ended_at = time.time()
+        ended_at = time.time()  # the run's end, not the time spent echoing
+        self._drain_echo()
 
+        # The run is over. What the live checks did not catch, the agent's
+        # own final report may still show: compare it with every cap
+        # before anything is claimed (see _final_reason).
+        if not self.breached:
+            reason = self._final_reason()
+            if reason:
+                with self._lock:
+                    self.breached = True
+                    self.breach_reason = reason
+                    self.breach_live = False
+
+        fig = self._final_figures()
         telemetry = self.telemetry_seen
         requested = self.telemetry_caps()
-        enforced = (["timeout"] if self.timeout is not None else []) + (
-            requested if telemetry else [])
-        not_enforced = [] if telemetry else requested
+        basis = {cap: self.cap_basis(cap) for cap in requested}
+        enforced = (["timeout"] if self.timeout is not None else []) + [
+            cap for cap in requested if basis[cap]]
+        not_enforced = [cap for cap in requested if not basis[cap]]
+        # Could the cap have stopped the run while it ran? The wall-clock
+        # limit always could; a telemetry cap only with per-message events.
+        enforced_live = {cap: cap == "timeout" or basis.get(cap) == "live"
+                         for cap in enforced}
+        assumed = self.price_assumed()
+        if assumed:
+            self.warnings.append(self._price_assumption_text())
+        after_only = [cap for cap in requested if basis[cap] == "final"]
+        if after_only and not self.breached:
+            self.warnings.append(
+                f"checked only after the run ended, not live: "
+                f"{', '.join(after_only)} (the agent sent no per-message "
+                f"usage events, so nothing but its final report was there "
+                f"to check, and these caps could not have stopped the run "
+                f"while it was going)")
 
         child_returncode = exit_code
         if exit_code is None:
@@ -755,27 +1098,23 @@ class Guard:
             exit_code = child_exit_code(exit_code)
         hint = None
         if self.breached:
-            if self.interrupted_by == "SIGINT":
-                exit_code = INTERRUPTED_EXIT_CODE
-            elif self.interrupted_by is not None:  # SIGTERM (SIGBREAK)
-                exit_code = TERMINATED_EXIT_CODE
+            if self.interrupted_by is not None:
+                exit_code = SIGNAL_EXIT_CODES.get(self.interrupted_by,
+                                                  TERMINATED_EXIT_CODE)
             else:
                 exit_code = BREACH_EXIT_CODE
             if (self.breach_reason or "").startswith("anomaly"):
-                hint = ANOMALY_HINT
+                hint = ANOMALY_HINT if self.breach_live else ANOMALY_HINT_AFTER
         elif self.agent_error and exit_code == 0:
             # The agent said the run failed even though it exited 0.
             exit_code = AGENT_ERROR_EXIT_CODE
-        elif not telemetry and requested and exit_code == 0:
-            # The child succeeded, but the caps the user asked for were
-            # never checked against anything: say so in the exit code.
+        elif not_enforced and exit_code == 0:
+            # The child succeeded, but a cap the user asked for was never
+            # checked against anything: say so in the exit code.
             exit_code = NO_TELEMETRY_EXIT_CODE
 
         cost_estimated = self.reported_cost is None
-        if not telemetry:
-            cost: float | None = None
-        else:
-            cost = self.reported_cost if not cost_estimated else self.estimated_cost()
+        cost: float | None = fig["cost"] if telemetry else None
 
         rec = receipt_mod.build_receipt(
             command=argv,
@@ -785,7 +1124,7 @@ class Guard:
             breach_reason=self.breach_reason,
             cost_usd=cost,
             cost_estimated=cost_estimated,
-            usage=dict(self.usage),
+            usage=fig["usage"],
             num_turns=self.num_turns,
             spawns=self.spawns,
             exit_code=exit_code,
@@ -798,6 +1137,9 @@ class Guard:
             usage_events=self.usage_events,
             enforced=enforced,
             not_enforced=not_enforced,
+            enforced_live=enforced_live,
+            breach_live=self.breach_live,
+            price_assumed=assumed,
             pricing={"as_of": self.pricing_table.as_of,
                      "source": self.pricing_table.source},
             warnings=list(self.warnings),
@@ -809,6 +1151,20 @@ class Guard:
             anomaly_armed=self._anomaly_armed,
         )
         show = not self.quiet
+        # Learn from every run that produced telemetry (breached runs are
+        # excluded from baselines; telemetry-less runs say nothing about
+        # what a normal run costs, so they are not recorded at all). Before
+        # the receipt is written, so that a history that cannot be written
+        # is a warning IN the receipt, not silence.
+        if telemetry:
+            try:
+                history_mod.record(rec, self.history_path)
+            except OSError as e:
+                note = (f"this run could not be recorded in the history "
+                        f"({e.strerror or e}): anomaly baselines will not "
+                        f"learn from it")
+                self.warnings.append(note)
+                rec["warnings"].append(note)
         if self.receipt_path:
             try:
                 receipt_mod.write_receipt(rec, self.receipt_path)
@@ -822,17 +1178,8 @@ class Guard:
                         f"{e.strerror or e}")
                 self.warnings.append(note)
                 rec["warnings"].append(note)
-                sys.stderr.write(f"shortleash: warning: {note}\n")
+                _say(f"shortleash: warning: {note}\n")
                 show = True
-        # Learn from every run that produced telemetry (breached runs are
-        # excluded from baselines; telemetry-less runs say nothing about
-        # what a normal run costs, so they are not recorded at all).
-        if telemetry:
-            try:
-                history_mod.record(rec, self.history_path)
-            except OSError:
-                pass
         if show:
-            sys.stderr.write(receipt_mod.format_human(rec) + "\n")
-            sys.stderr.flush()
+            _say(receipt_mod.format_human(rec) + "\n")
         return exit_code

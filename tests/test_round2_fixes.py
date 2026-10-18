@@ -17,7 +17,6 @@ import json
 import os
 import sys
 import tempfile
-import tomllib
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -26,6 +25,11 @@ import shortleash
 from shortleash import cli as cli_mod
 from shortleash import receipt as receipt_mod
 from shortleash.guard import Guard, BREACH_EXIT_CODE
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # 3.10: the metadata tests below skip themselves
+    tomllib = None
 
 PY = sys.executable
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -154,6 +158,8 @@ class TestVersionSingleSource(unittest.TestCase):
         with open(os.path.join(REPO, "pyproject.toml"), "rb") as f:
             return tomllib.load(f)
 
+    @unittest.skipIf(tomllib is None, "tomllib is Python 3.11+; "
+                     "pyproject.toml is the same file on every interpreter")
     def test_pyproject_reads_version_dynamically(self):
         pp = self._pyproject()
         self.assertIn("version", pp["project"].get("dynamic", []),
@@ -161,6 +167,8 @@ class TestVersionSingleSource(unittest.TestCase):
         attr = (pp["tool"]["setuptools"]["dynamic"]["version"]["attr"])
         self.assertEqual(attr, "shortleash.__version__")
 
+    @unittest.skipIf(tomllib is None, "tomllib is Python 3.11+; "
+                     "pyproject.toml is the same file on every interpreter")
     def test_version_resolves_to_package_version(self):
         pp = self._pyproject()
         attr = pp["tool"]["setuptools"]["dynamic"]["version"]["attr"]

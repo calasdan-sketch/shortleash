@@ -15,7 +15,9 @@ Subcommands:
 import argparse
 import errno
 import atexit
+import math
 import os
+import sqlite3
 import sys
 
 from . import cacheopt
@@ -49,19 +51,20 @@ def _harden_streams() -> None:
 def _add_run_parser(sub) -> None:
     r = sub.add_parser("run", help="Run a command under guardrails.")
     r.add_argument("--budget", type=float, default=None,
-                   help="Max estimated spend in USD before the run is killed.")
+                   help="Max estimated spend in USD before the run is killed "
+                        "(a finite number >= 0).")
     r.add_argument("--max-spawns", type=int, default=None,
                    help="Max subagent spawns before the run is killed.")
     r.add_argument("--max-tokens", type=int, default=None,
                    help="Max total tokens (in+out+cache) before the run is killed.")
     r.add_argument("--timeout", type=float, default=None,
                    help="Max wall-clock seconds before the run is killed "
-                        "(must be > 0).")
+                        "(a finite number > 0).")
     r.add_argument("--grace-period", type=float, default=5.0,
                    help="Seconds between SIGTERM and SIGKILL on breach "
                         "(POSIX; Windows force-kills the tree at once), "
                         "and how long to wait for stray child processes "
-                        "after the command exits.")
+                        "after the command exits (a finite number >= 0).")
     r.add_argument("--pricing", type=str, default=None,
                    help="JSON file overriding the fallback pricing table "
                         f"(or set ${pricing.PRICING_ENV}). The built-in "
@@ -209,11 +212,16 @@ def _cmd_cache(args) -> int:
 
 
 def _cmd_fleet(args) -> int:
-    conn = fleet_mod.connect()
     try:
-        claims = fleet_mod.active_claims(conn)
-    finally:
-        conn.close()
+        conn = fleet_mod.connect()
+        try:
+            claims = fleet_mod.active_claims(conn)
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError) as e:
+        print(f"shortleash: error: the fleet database is unusable "
+              f"({_fleet_db()}): {e}", file=sys.stderr)
+        return 1
     if not claims:
         print("no active fleet claims")
         return 0
@@ -224,6 +232,10 @@ def _cmd_fleet(args) -> int:
             line += f"  — {c['note']}"
         print(line)
     return 0
+
+
+def _fleet_db() -> str:
+    return fleet_mod.DB_PATH or fleet_mod.paths.fleet_db_path()
 
 
 def _caps_banner(args) -> str:
@@ -303,11 +315,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "fleet":
         return _print_command(_cmd_fleet, args)
     if args.cmd == "run":
+        # A cap that is NaN or infinite compares False with everything: it
+        # would never trip, yet the banner and the receipt would list it as
+        # enforced. Refuse it before anything is spent.
+        for flag, value in (("--budget", args.budget),
+                            ("--timeout", args.timeout),
+                            ("--grace-period", args.grace_period),
+                            ("--anomaly", args.anomaly)):
+            if value is not None and not math.isfinite(value):
+                parser.error(f"{flag} must be a finite number (got {value:g})")
         # Guardrail caps must be non-negative; a negative cap would either
         # trip every run instantly or (worse) disable the check silently.
         for flag, value in (("--budget", args.budget),
                             ("--max-spawns", args.max_spawns),
-                            ("--max-tokens", args.max_tokens)):
+                            ("--max-tokens", args.max_tokens),
+                            ("--grace-period", args.grace_period)):
             if value is not None and value < 0:
                 parser.error(f"{flag} must be >= 0 (got {value})")
         # A zero timeout would trip the instant the child starts.
@@ -371,16 +393,26 @@ def _run_with_fleet(g, cmd: list[str], args) -> int:
     return (tree killed, receipt written), so the release runs in the
     `finally`; atexit and the claim TTL back it up for a hard kill."""
     paths = args.claim or [os.getcwd()]
-    conn = fleet_mod.connect()
     try:
-        res = fleet_mod.claim(conn, paths, owner=args.fleet_owner,
-                              note=f"shortleash run: {guard_mod.agent_name(cmd[0])}",
-                              ttl=args.fleet_ttl)
+        conn = fleet_mod.connect()
+        try:
+            res = fleet_mod.claim(
+                conn, paths, owner=args.fleet_owner,
+                note=f"shortleash run: {guard_mod.agent_name(cmd[0])}",
+                ttl=args.fleet_ttl)
+        finally:
+            conn.close()
     except ValueError as e:
         print(f"shortleash: fleet claim error: {e}", file=sys.stderr)
         return 2
-    finally:
-        conn.close()
+    except (sqlite3.Error, OSError) as e:
+        # A claim is advisory (a conflict only warns): a database that
+        # cannot be opened is a warning too, never a reason not to run.
+        note = (f"fleet database unusable ({_fleet_db()}): {e}; running "
+                f"WITHOUT a claim")
+        sys.stderr.write(f"[shortleash] fleet WARNING: {note}\n")
+        g.warnings.append(note)
+        return g.run(cmd)
     claim_id = res.get("claim_id")
 
     def _release() -> None:

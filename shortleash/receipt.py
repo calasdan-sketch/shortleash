@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from datetime import datetime, timezone
@@ -87,6 +88,19 @@ def redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
     return out
 
 
+def _sanitize(obj):
+    """A copy of ``obj`` with every non-finite float replaced by None: JSON
+    has no Infinity / NaN, and a bare `Infinity` token breaks every strict
+    parser that reads the receipt."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+
 def build_receipt(
     *,
     command: list[str],
@@ -117,7 +131,15 @@ def build_receipt(
     hint: str | None = None,
     child_returncode: int | None = None,
     anomaly_armed: dict | None = None,
+    enforced_live: dict | None = None,
+    breach_live: bool | None = None,
+    price_assumed: bool = False,
 ) -> dict:
+    warnings = list(warnings or [])
+    if cost_usd is not None and not math.isfinite(cost_usd):
+        cost_usd = None
+        warnings.append("the cost was not a finite number (absurd usage was "
+                        "reported) and is shown as n/a")
     return {
         "tool": "shortleash",
         "version": __version__,
@@ -157,12 +179,23 @@ def build_receipt(
         "usage_events": usage_events,
         "enforced": list(enforced or []),
         "not_enforced": list(not_enforced or []),
+        # For each cap in `enforced`: could it stop the run while it ran
+        # (true), or was it only checked against the agent's final report
+        # once the run was over (false)? Only the wall-clock limit and caps
+        # fed by per-message usage events are live.
+        "enforced_live": dict(enforced_live or {}),
+        # None: not breached. True: the leash ended the run. False: the
+        # breach was only found after the run was over (nothing stopped).
+        "breach_live": breach_live,
         # --anomaly: {"armed", "runs", "min_runs", "multiplier"}, or None
         # when anomaly mode was not requested. Un-armed means no anomaly
         # cap held (it is then in neither enforced nor not_enforced).
         "anomaly": anomaly_armed,
         "pricing": pricing,
-        "warnings": list(warnings or []),
+        # True when usage was priced but no table entry names the model: the
+        # estimate behind the caps used the fallback rate (a warning says so).
+        "price_assumed": bool(price_assumed),
+        "warnings": warnings,
         # The agent's own verdict: a stream-json `result` with is_error
         # true is a failed run even when the process exited 0.
         "agent_error": bool(agent_error),
@@ -195,7 +228,9 @@ def format_human(receipt: dict) -> str:
     t = receipt["tokens"]
     total_tokens = t["input"] + t["output"] + t["cache_write"] + t["cache_read"]
     telemetry = receipt.get("telemetry_seen", True)
-    if receipt["cost_usd"] is None or not telemetry:
+    if telemetry and receipt["cost_usd"] is None:
+        cost_line = "  cost:      n/a (not a finite number)"
+    elif receipt["cost_usd"] is None or not telemetry:
         cost_line = f"  cost:      n/a ({NO_TELEMETRY_MSG})"
     else:
         cost_line = (f"  cost:      ${receipt['cost_usd']:.4f}"
@@ -217,7 +252,10 @@ def format_human(receipt: dict) -> str:
                      f"{pricing.get('as_of', '?')} — verify against "
                      f"provider pricing")
     if receipt["breached"]:
-        lines.append(f"  STOPPED:   {receipt['breach_reason']}")
+        # EXCEEDED, not STOPPED, when the breach was only found after the
+        # run was over: nothing was stopped, and saying so would be a lie.
+        verb = "EXCEEDED:" if receipt.get("breach_live") is False else "STOPPED: "
+        lines.append(f"  {verb}  {receipt['breach_reason']}")
         if receipt.get("hint"):
             lines.append(f"  hint:      {receipt['hint']}")
     elif receipt.get("agent_error"):
@@ -228,6 +266,11 @@ def format_human(receipt: dict) -> str:
         # Never print the green tick here: a cost cap cannot have held
         # when the child never reported any usage.
         lines.append(f"  WARNING:   {no_telemetry_line(receipt)}")
+    elif receipt.get("not_enforced"):
+        # Some of the caps asked for were checked against nothing.
+        lines.append(f"  WARNING:   NOT enforced: "
+                     f"{', '.join(receipt['not_enforced'])} (nothing to "
+                     f"check against)")
     else:
         lines.append("  finished within guardrails ✓")
     for w in receipt.get("warnings") or []:
@@ -262,4 +305,4 @@ def prepare_receipt_path(path: str) -> None:
 
 def write_receipt(receipt: dict, path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(receipt, f, indent=2)
+        json.dump(_sanitize(receipt), f, indent=2, allow_nan=False)

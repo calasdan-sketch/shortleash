@@ -36,6 +36,7 @@ touched on the platform that has them.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -58,6 +59,43 @@ def popen_kwargs() -> dict:
     if is_windows():
         return {"creationflags": CREATE_NEW_PROCESS_GROUP}
     return {"start_new_session": True}
+
+
+#: prctl(2) option PR_SET_PDEATHSIG (Linux): the signal the kernel sends a
+#: process when its parent dies.
+_PR_SET_PDEATHSIG = 1
+
+
+def parent_death_kwargs() -> dict:
+    """Extra ``subprocess.Popen`` keywords that make the kernel SIGKILL the
+    child when the leash dies. Linux only, best effort, and only the direct
+    child (not its descendants): a SIGKILLed leash cannot clean up after
+    itself, and without this the agent -- in its own session -- would run on,
+    uncapped, with nobody watching. Anywhere else (macOS, Windows -- where
+    the Job Object does it) or when libc cannot be reached it is ``{}``."""
+    if not sys.platform.startswith("linux"):
+        return {}
+    try:
+        import ctypes
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+        prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+                          ctypes.c_ulong, ctypes.c_ulong]
+        prctl.restype = ctypes.c_int
+        sigkill = int(signal.SIGKILL)
+    except Exception:
+        return {}
+    leash = os.getpid()
+
+    def _die_with_the_leash() -> None:  # runs in the child, before exec
+        try:
+            prctl(_PR_SET_PDEATHSIG, sigkill, 0, 0, 0)
+            if os.getppid() != leash:
+                # the leash died before the call took effect
+                os._exit(1)
+        except Exception:
+            pass
+
+    return {"preexec_fn": _die_with_the_leash}
 
 
 def taskkill_command(pid: int) -> list[str]:
@@ -123,7 +161,6 @@ def _signal_group(pgid: int, sig: int) -> bool:
 
 def _kill_tree_posix(proc: subprocess.Popen, grace: float,
                      child_exited: bool) -> int:
-    import signal  # local: keeps SIGKILL out of the Windows code path
     pgid = proc.pid  # start_new_session=True => pgid == pid
     if not _signal_group(pgid, signal.SIGTERM):
         return 0  # group already empty: nothing escaped

@@ -26,7 +26,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -37,6 +36,11 @@ from shortleash import proctree
 from shortleash import receipt as receipt_mod
 from shortleash.guard import (INTERRUPTED_EXIT_CODE, TERMINATED_EXIT_CODE,
                               Guard, agent_name, child_exit_code)
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # 3.10: the metadata tests below skip themselves
+    tomllib = None
 
 PY = sys.executable
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -400,6 +404,8 @@ class TestAnomalyNotArmed(unittest.TestCase):
 # L-4
 
 class TestPackagingMetadata(unittest.TestCase):
+    @unittest.skipIf(tomllib is None, "tomllib is Python 3.11+; "
+                     "pyproject.toml is the same file on every interpreter")
     def test_pyproject_license_classifiers_urls(self):
         with open(os.path.join(REPO, "pyproject.toml"), "rb") as f:
             data = tomllib.load(f)

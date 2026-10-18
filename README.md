@@ -3,7 +3,9 @@
 A circuit breaker for AI coding-agent runs. Wraps an agent command, tails its
 telemetry in real time, and **kills the run the moment it breaches a guardrail**
 — budget, subagent-spawn cap, token cap, or wall-clock timeout. Emits a
-per-run receipt showing what it cost and why it stopped.
+per-run receipt showing what it cost and why it stopped. "The moment" needs
+an agent that streams its usage; an agent that only reports at the end can be
+checked, but no longer stopped (see *Live, or only afterwards*).
 
 Vendors' "budgets" only warn while the meter keeps running. This one halts.
 
@@ -38,13 +40,25 @@ shortleash run --budget 5.00 --max-spawns 10 --max-tokens 500000 \
 ```
 
 Only the caps you set are enforced; the banner lists them (or says
-`no caps set`). `--timeout` must be greater than zero.
+`no caps set`). `--timeout` must be greater than zero, and `--budget`,
+`--timeout`, `--grace-period` and `--anomaly` must be finite numbers: `nan`
+and `inf` are refused with exit `2` before anything runs, because a cap that
+can never trip must not be listed as enforced (before 0.1.1 `--budget nan`
+ran the agent unguarded and the receipt called the budget enforced).
 
 When wrapping `claude`, `--output-format stream-json --verbose` are added
 automatically (the guard needs the telemetry stream). The agent's stdout
 passes through untouched, so you still watch it work — and if whatever is
 reading it goes away (`shortleash run … | head -1`), the echo stops but the
-caps keep being checked; the receipt notes it. Non-JSON lines on that
+caps keep being checked; the receipt notes it. A reader that merely
+*stalls* (a paused pager, a pipe nobody drains) cannot blind the caps
+either: every line is parsed first and handed to the echo through a bounded
+queue (4 MB) on a thread of its own. When the queue is full lines are
+dropped, never waited for, and the receipt counts them (`warning: the
+reader of our stdout was not keeping up: N line(s) of the agent's output
+were not echoed`). If that reader is still stuck when the run ends, the
+leash gives up on it after two seconds without progress, so the summary and
+the exit code are not held hostage. Non-JSON lines on that
 stdout (warnings, entrypoint chatter) are not telemetry and are ignored; a
 telemetry event whose fields are malformed (`"input_tokens": "abc"`) trips
 the run — the guard fails closed rather than guess.
@@ -55,13 +69,19 @@ discovered after the money was spent. Should the write still fail at the
 end (disk full), the receipt summary is printed on stderr instead, with a
 warning, even under `--quiet`.
 
-### Stopping the leash (Ctrl-C, SIGTERM)
+### Stopping the leash (Ctrl-C, SIGTERM, SIGHUP, SIGQUIT)
 
 The agent runs in its own process group, so a Ctrl-C in your terminal (or a
 `kill` from a supervisor) reaches **only the leash**. The leash then kills
 the agent's whole process tree, writes the receipt (`STOPPED: interrupted
 (Ctrl-C)` / `terminated (SIGTERM)`) and exits `130` / `143` — it never dies
-with a traceback leaving the agent running. A second Ctrl-C during the
+with a traceback leaving the agent running. Closing the terminal or losing
+an SSH connection is a SIGHUP, and Ctrl-\ a SIGQUIT: both are handled the
+same way (`terminated (SIGHUP)`, exit `129`; `terminated (SIGQUIT)`, exit
+`131`). Before 0.1.1 either one killed the leash on the spot and left the
+agent running, uncapped, with no receipt. A hangup the parent chose to
+ignore stays ignored, so `nohup shortleash run …` still does what nohup is
+for: the run carries on without its terminal. A second Ctrl-C during the
 grace period force-kills at once. This holds at every point of the run,
 including the window after the agent itself has exited while the leash
 waits for stray processes it left behind (see *Killing the tree*): a signal
@@ -69,6 +89,12 @@ there kills them at once, with no grace, and the receipt says `STOPPED:
 interrupted (Ctrl-C): the leash was signalled after the command exited and
 killed the process(es) it left running`. On Windows, Ctrl-Break is handled
 like SIGTERM.
+
+SIGKILL (and a crash) cannot be handled: no receipt is written. On Linux the
+kernel is asked to SIGKILL the agent together with the leash
+(`PR_SET_PDEATHSIG`, best effort — the agent itself, not the processes it
+spawned); on macOS nothing does, so a `kill -9` of the leash leaves the
+agent running; on Windows the kill-on-close Job Object ends the tree.
 
 ### Anomaly mode (`--anomaly`, opt-in)
 
@@ -123,6 +149,12 @@ shortleash fleet list
 - Released automatically on exit (normal, Ctrl-C/SIGTERM, or crash via the
   TTL backstop). Tune with `--fleet-owner "dan"` and `--fleet-ttl 3600`.
 - `shortleash fleet list` shows who holds what right now.
+- A claim is advisory, so a fleet database that cannot be used (a corrupt
+  `fleet.db`, a home that cannot be written) is a warning, not a stop:
+  `run --fleet` prints `fleet WARNING: … running WITHOUT a claim`, records
+  it in the receipt and runs the agent; `fleet list` prints one
+  `shortleash: error:` line and exits `1`. Before 0.1.1 both were a
+  traceback, and the run never started.
 
 ### Killing the tree
 
@@ -148,11 +180,12 @@ design; the receipt warns about it instead of waiting forever.
 
 | code | meaning |
 |---|---|
-| `124` | a cap tripped and the tree was killed (mirrors `timeout(1)`) |
-| `125` | a budget/token/spawn/anomaly cap was requested but the child produced **no usage telemetry** — the cap could not have been enforced (see *Trust boundary*) |
-| `130` / `143` | the leash itself got Ctrl-C / SIGTERM (Ctrl-Break on Windows) — at any point, the wait for stray children after the agent exited included; tree killed, receipt written |
+| `124` | a cap tripped and the tree was killed (mirrors `timeout(1)`) — or a cap turned out to be exceeded only in the agent's *final report*, after the run had ended (`EXCEEDED:` in the receipt, `breach_live: false`; see *Live, or only afterwards*) |
+| `125` | a budget/token/spawn/anomaly cap was requested but there was nothing to enforce it against: the child produced **no usage telemetry**, or — for the spawn cap — no per-message events. The cap could not have been enforced (see *Trust boundary*) |
+| `130` / `143` / `129` / `131` | the leash itself got Ctrl-C / SIGTERM / SIGHUP / SIGQUIT (Ctrl-Break on Windows is `143`) — at any point, the wait for stray children after the agent exited included; tree killed, receipt written |
 | `1` | the process exited 0 but its final stream-json `result` said `is_error: true` (`FAILED:` in the receipt, e.g. "Not logged in") |
 | `128+N` | POSIX: the child was killed by signal N outside any breach (what a shell would report) |
+| `126` | the command was found but could not be started (a directory, no execute permission, not an executable file, a path through a file): one `shortleash: error: cannot start …` line and no receipt, as nothing ran. Before 0.1.1 this was a traceback and exit `1` |
 | `2` | usage error, command not found, unsafe `.cmd` launch refused, receipt path not writable |
 | other | the child's own exit code (on Windows its 32-bit status, clamped to 0–255; the raw value is `child_returncode` in the receipt) |
 
@@ -173,13 +206,23 @@ Every run ends with a receipt on stderr and optionally as JSON
 
 Mid-run cost is estimated from a fallback pricing table (clearly marked);
 the final receipt prefers the agent-reported `total_cost_usd` when the run
-completes. The receipt JSON also carries `telemetry_seen`, `usage_events`,
-`enforced` / `not_enforced` (which caps actually held), `anomaly` (whether
+completes, and the agent's final report is compared with every cap once the
+run is over. The receipt JSON also carries `telemetry_seen`, `usage_events`,
+`enforced` / `not_enforced` (which caps actually held), `price_assumed`
+(the estimate had to assume a rate for an unknown model), `enforced_live` (for
+each enforced cap: `true` if it could stop the run while it ran, `false` if
+it was only checked against the final report afterwards), `breach_live`
+(`true`: the leash ended the run; `false`: the breach was only found after
+the run was over; `null`: no breach), `anomaly` (whether
 anomaly mode was armed, and on how many runs), `pricing` (`as_of`,
 `source`), `agent_error` (the `is_error` verdict), `child_returncode` (what
 the child itself returned, untouched), `hint` and `warnings` (stray child
 processes, a closed stdout, corrupt history lines, an un-armed anomaly cap,
-a receipt that could not be written).
+a receipt that could not be written, a history that could not be written).
+The JSON never contains a bare `Infinity` or `NaN`: a figure that is not a
+finite number (an agent reporting a usage count beyond any float) is
+`null`, the receipt says `cost: n/a (not a finite number)` with a warning,
+and such a run is not added to the history.
 
 ### What the receipt stores about your command
 
@@ -211,7 +254,21 @@ JSON file:
 
 `as_of` is optional metadata echoed in the receipt; every other key is a
 case-insensitive substring matched against the model name, mapped to
-`[input, output]` dollars per 1M tokens.
+`[input, output]` dollars per 1M tokens. The entries of your file are tried
+first and the built-in table after them; within each, the **longest**
+matching key wins, so `{"opus-4-5": [5, 25]}` prices `claude-opus-4-5` at
+5 / 25 while other opus models keep the built-in rate (before 0.1.1 the
+built-in `opus` entry won and the override was silently ignored). Rates
+must be finite numbers >= 0 and a key must not be empty: `NaN`, `Infinity`,
+negative values and `""` are refused with exit `2` (a NaN rate would have
+let every run through).
+
+A model that matches **no** entry is priced with the `default` entry
+(Sonnet's rate) — and the leash says so instead of guessing quietly: one
+`[shortleash] warning: model 'x' is not in the pricing table …` line on
+stderr as soon as the model is known (not under `--quiet`), the same text
+as a receipt `warning:`, and `"price_assumed": true` in the receipt JSON.
+Add the model to your pricing file to silence it.
 
 ### No telemetry, no comfort
 
@@ -229,6 +286,40 @@ The exit code is `125` in that case (the run itself may have succeeded,
 but the cap you asked for never held), the cost is `null` rather than
 `$0.00`, and the run is not added to the anomaly history.
 
+### Live, or only afterwards
+
+A cap can stop a run only while the agent is still telling you what it
+spends. What the leash can do depends on what the agent prints:
+
+| the agent prints | checked | when |
+|---|---|---|
+| a stream-json event per message (`claude -p --output-format stream-json --verbose`, added automatically when you wrap `claude`) | budget, tokens, spawns, anomaly after every `assistant` event, and again against the final `result` | **live** — the tree is killed the moment a cap is crossed |
+| only a final `result` (a single JSON object at the end) | budget, tokens and (when armed) anomaly, from the `result`'s `total_cost_usd` / `usage` | **after the run ended** — too late to stop anything, but reported honestly |
+| anything else | nothing but `--timeout` | see *No telemetry, no comfort* |
+
+Whether `claude -p --output-format json` prints exactly that one `result`
+object has **not been verified against the real `claude` CLI**; the leash
+treats any output of that shape the way the second row says.
+
+When the agent's final report shows a cap exceeded after the fact, the run
+is *not* "within guardrails": the leash exits `124`, the receipt says
+`EXCEEDED:` (not `STOPPED:` — nothing was stopped), the reason says
+`after the fact`, and `breach_live` is `false`:
+
+```
+  cost:      $50.0000 (reported)
+  EXCEEDED:  budget exceeded after the fact: $50.0000 reported by the agent > $1.00 cap (no live usage events were seen, so nothing could be stopped while it ran)
+```
+
+A run that stayed within the caps but was checked only afterwards still
+ends `finished within guardrails ✓`, with a `warning:` line saying the cap
+was checked only after the run (`enforced_live` is `false` for it). The
+spawn cap needs the per-message events (only they list the `tool_use`
+blocks): with a final `result` alone it is reported under `not_enforced`
+and the exit code is `125`. A final report whose cost is not a finite number
+(`1e999`, `NaN`) is malformed telemetry and trips the run, like any other
+malformed field.
+
 ## How it works
 
 - Child runs in its own process group on POSIX (`start_new_session=True`)
@@ -237,7 +328,8 @@ but the cap you asked for never held), the cost is `null` rather than
   whole tree, never your shell.
 - A monitor thread parses each stream-json line (`system/init`,
   `assistant` usage + subagent `tool_use` spawns, `result` cost/`is_error`)
-  and checks caps after every observation.
+  and checks caps after every observation; a second thread echoes the
+  lines to your stdout, so nothing about your terminal can delay a check.
 - Claude Code emits **one `assistant` event per content block**, all with
   the same `message.id` and the same `usage` (its docs say so). Usage is
   counted once per message id — a block that arrives with a larger
@@ -284,6 +376,9 @@ Be honest about what the guard can and can't see:
   totals *down*, but it cannot see spend the child simply hides.
 - **Only `--timeout` is enforced independently of the child** — a
   wall-clock watchdog, immune to telemetry lies.
+- **Without per-message events a cap cannot stop anything.** An agent that
+  reports its spend only in a final `result` is checked after it has
+  finished (`EXCEEDED:`, `enforced_live: false`), not while it runs.
 - **No telemetry at all means no cost cap was enforced.** The receipt
   then says `no usage data seen — only the wall-clock/time limit was
   enforced`, lists the caps that were NOT enforced, reports the cost as
@@ -327,9 +422,28 @@ returns and kills the whole tree, sends the leash itself Ctrl-C and SIGTERM
 at a temp dir). The Windows shim resolution and the cmd.exe refusal list
 are unit-tested with a fake shim directory on every platform.
 
-## Scope / limits (v0.1.0)
+## Scope / limits (v0.1.1)
 
 - Claude Code `-p` (non-interactive) is the supported path. Interactive
   sessions and other agents (Codex, Cursor) are on the roadmap — the
   event parser is isolated in `events.py` for exactly this.
 - Cost mid-run is an estimate; treat `--budget` as a guardrail, not accounting.
+- **Live enforcement needs per-message events.** An agent that reports only
+  a final `result` can be checked after it has finished, not stopped (see
+  *Live, or only afterwards*). Whether the real `claude` CLI's
+  `--output-format json` has that shape has **not been verified** here.
+- **The agent's own report is the evidence.** The leash cannot see spend an
+  agent hides or under-reports (see *Trust boundary*); a final report is
+  compared with the caps but not audited.
+- **SIGKILL of the leash cannot be handled** (no receipt). On Linux the
+  agent is asked to die with it, but only the agent itself, not what it
+  spawned; macOS has no equivalent; Windows relies on the Job Object.
+- **A reader of our stdout that stops reading** costs the echo, not the
+  caps: lines are dropped (and counted) once 4 MB are queued, and the leash
+  stops waiting for that reader two seconds after its last progress. Until
+  then the leash's own exit can wait for it.
+- **Windows:** SIGHUP and SIGQUIT do not exist there; Ctrl-Break and the
+  kill-on-close Job Object are what apply. The signal, echo-thread and
+  exit-code changes of 0.1.1 were written to be platform-neutral and are
+  covered by tests that run on Windows too, but they were developed and run
+  on Linux only.

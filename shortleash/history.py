@@ -24,6 +24,7 @@ warning; it must never stop the agent from starting.
 from __future__ import annotations
 
 import json
+import math
 import os
 import statistics
 
@@ -37,19 +38,37 @@ def default_history_path() -> str:
     return paths.history_path()
 
 
+#: Figures beyond these are not a real run's: a baseline built from them
+#: (a median of absurd numbers) would stop every later run from starting.
+_MAX_COST = 1e12
+_MAX_TOKENS = 10 ** 18
+
+
+def _sane(cost, tokens) -> bool:
+    return (isinstance(cost, (int, float)) and math.isfinite(cost)
+            and abs(cost) <= _MAX_COST and abs(tokens) <= _MAX_TOKENS)
+
+
 def record(receipt: dict, path: str | None = None) -> None:
+    """Append one run to the history. A run whose figures are not usable
+    numbers (no cost, infinite, absurd) is not recorded: it says nothing
+    about what a normal run costs."""
     path = path or default_history_path()
+    cost = receipt.get("cost_usd", 0.0)
+    tokens = sum(receipt.get("tokens", {}).values())
+    if not _sane(cost, tokens):
+        return
     os.makedirs(os.path.dirname(path), exist_ok=True)
     entry = {
         "agent": receipt.get("agent", ""),
         "profile": receipt.get("profile", ""),
-        "cost_usd": receipt.get("cost_usd", 0.0),
-        "tokens": sum(receipt.get("tokens", {}).values()),
+        "cost_usd": cost,
+        "tokens": tokens,
         "breached": receipt.get("breached", False),
         "ended_at": receipt.get("ended_at", ""),
     }
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+        f.write(json.dumps(entry, allow_nan=False) + "\n")
 
 
 def _key(entry: dict) -> str:
@@ -68,8 +87,10 @@ def _parse_entry(line: str) -> tuple[str, float, int, bool] | None:
     try:
         cost = float(e.get("cost_usd", 0) or 0)
         tokens = int(e.get("tokens", 0) or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
+    if not _sane(cost, tokens):
+        return None  # Infinity / NaN / absurd: corrupt, not a data point
     return _key(e), cost, tokens, bool(e.get("breached"))
 
 

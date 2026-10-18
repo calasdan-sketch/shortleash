@@ -106,7 +106,9 @@ def parse_line(line: str) -> dict | None:
             "is_error": bool(ev.get("is_error")),
             "subtype": ev.get("subtype") or "",
             "num_turns": int(ev.get("num_turns") or 0),
-            "usage": _usage_of({"usage": ev.get("usage")}),
+            # The run's final totals, or None when the report has none.
+            "usage": (_usage_of({"usage": ev["usage"]})
+                      if isinstance(ev.get("usage"), dict) else None),
             "session_id": ev.get("session_id") or "",
             # The error message when is_error is set ("Not logged in", ...).
             # Bounded: never store a whole final answer in the receipt.

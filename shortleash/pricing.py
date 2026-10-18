@@ -18,13 +18,18 @@ Pricing JSON format (USD per 1M tokens, [input, output]):
      "sonnet": [3.0, 15.0], "opus": [15.0, 75.0], "haiku": [0.8, 4.0]}
 
 "as_of" is optional metadata and is echoed in the receipt; every other
-key is a case-insensitive substring matched against the model name.
+key is a case-insensitive substring matched against the model name. The
+entries of your file are tried first and the built-in table after them; in
+each, the LONGEST matching key wins ("opus-4-5" beats "opus"). A model that
+matches nothing is priced with the "default" entry, and the receipt says so
+(`price_assumed`). Rates must be finite numbers >= 0.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 
 #: Date the hard-coded table below was written. Nothing updates it
@@ -58,18 +63,24 @@ class PricingTable:
     rates: dict                      # model substring -> (in, out) per 1M
     as_of: str = PRICING_AS_OF       # ISO date the numbers were written
     source: str = "built-in fallback table"
+    # The entries that came from the user's file (a subset of ``rates``):
+    # they are tried before the built-in ones.
+    overrides: dict = dataclasses.field(default_factory=dict)
 
     def describe(self) -> str:
         return (f"{self.source} as of {self.as_of} "
                 f"— verify against provider pricing")
 
 
-def _parse_rates(data: dict, pricing: dict, where: str) -> str | None:
+def _parse_rates(data: dict, pricing: dict, where: str,
+                 overrides: dict | None = None) -> str | None:
     """Merge model -> [in, out] pairs from a JSON object into pricing.
 
     Returns the file's as_of string (or None). Raises ValueError with
-    the offending key for anything that is not a two-number list — a
-    metadata string such as "as_of" must never be read as a rate pair.
+    the offending key for anything that is not a two-number list of finite,
+    non-negative numbers — a metadata string such as "as_of" must never be
+    read as a rate pair, and a NaN or negative rate would silently disable
+    or invert the budget cap. Every pair also goes into ``overrides``.
     """
     if not isinstance(data, dict):
         raise ValueError(f"{where}: top level must be a JSON object")
@@ -84,7 +95,19 @@ def _parse_rates(data: dict, pricing: dict, where: str) -> str | None:
                 or isinstance(v[0], (bool, str)) or isinstance(v[1], (bool, str))):
             raise ValueError(
                 f"{where}: {k!r} must be [input_per_1M, output_per_1M], got {v!r}")
-        pricing[key] = (float(v[0]), float(v[1]))
+        if not key.strip():
+            raise ValueError(f"{where}: a model key must not be empty "
+                             f"(it would match every model)")
+        try:
+            rate = (float(v[0]), float(v[1]))
+        except (TypeError, ValueError, OverflowError):
+            rate = (math.nan, math.nan)
+        if not all(math.isfinite(x) and x >= 0 for x in rate):
+            raise ValueError(
+                f"{where}: {k!r} rates must be finite numbers >= 0, got {v!r}")
+        pricing[key] = rate
+        if overrides is not None:
+            overrides[key] = rate
     return as_of
 
 
@@ -99,10 +122,11 @@ def load_table(path: str | None = None,
     with open(source_path, encoding="utf-8") as f:
         data = json.load(f)
     rates = dict(DEFAULT_PRICING)
-    as_of = _parse_rates(data, rates, source_path)
+    overrides: dict = {}
+    as_of = _parse_rates(data, rates, source_path, overrides)
     label = source_path if path else f"{source_path} (${PRICING_ENV})"
     return PricingTable(rates=rates, as_of=as_of or "unknown (no as_of in file)",
-                        source=label)
+                        source=label, overrides=overrides)
 
 
 def _rates_of(pricing) -> dict:
@@ -111,12 +135,34 @@ def _rates_of(pricing) -> dict:
     return pricing or DEFAULT_PRICING
 
 
-def _rate_for(model: str, pricing: dict) -> tuple[float, float]:
+def _longest_key(model: str, table: dict) -> str | None:
+    best = None
+    for key in table:
+        if key != "default" and key in model and (
+                best is None or len(key) > len(best)):
+            best = key
+    return best
+
+
+def match(model: str, pricing=None) -> tuple[str, tuple[float, float]]:
+    """Which table entry prices ``model``: (key, (input, output) per 1M).
+
+    The user's own entries are tried first, then the whole table; in each
+    the longest key contained in the model name wins. ``"default"`` as the
+    key means nothing matched and the fallback rate is an assumption.
+    ``pricing`` may be a rates dict or a PricingTable."""
     m = (model or "").lower()
-    for key in pricing:
-        if key != "default" and key in m:
-            return pricing[key]
-    return pricing["default"]
+    rates = _rates_of(pricing)
+    overrides = pricing.overrides if isinstance(pricing, PricingTable) else {}
+    for table in (overrides, rates):
+        key = _longest_key(m, table)
+        if key is not None:
+            return key, rates[key]
+    return "default", rates.get("default", DEFAULT_PRICING["default"])
+
+
+def _rate_for(model: str, pricing: dict) -> tuple[float, float]:
+    return match(model, pricing)[1]
 
 
 def estimate_cost(model: str, usage: dict, pricing=None) -> float:
@@ -124,13 +170,17 @@ def estimate_cost(model: str, usage: dict, pricing=None) -> float:
 
     ``pricing`` may be a rates dict or a PricingTable.
     """
-    rates = _rates_of(pricing)
-    in_rate, out_rate = _rate_for(model, rates)
+    in_rate, out_rate = match(model, pricing)[1]
     u = usage
-    tokens = (
-        u.get("input", 0) * in_rate
-        + u.get("output", 0) * out_rate
-        + u.get("cache_read", 0) * in_rate * CACHE_READ_FACTOR
-        + u.get("cache_write", 0) * in_rate * CACHE_WRITE_FACTOR
-    )
+    try:
+        tokens = (
+            u.get("input", 0) * in_rate
+            + u.get("output", 0) * out_rate
+            + u.get("cache_read", 0) * in_rate * CACHE_READ_FACTOR
+            + u.get("cache_write", 0) * in_rate * CACHE_WRITE_FACTOR
+        )
+    except OverflowError:
+        # A count too large for a float: the cost is "more than anything",
+        # which compares above every cap -- never an exception.
+        return math.inf
     return tokens / 1_000_000
