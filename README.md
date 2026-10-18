@@ -47,21 +47,39 @@ can never trip must not be listed as enforced (before 0.1.1 `--budget nan`
 ran the agent unguarded and the receipt called the budget enforced).
 
 When wrapping `claude`, `--output-format stream-json --verbose` are added
-automatically (the guard needs the telemetry stream). The agent's stdout
-passes through untouched, so you still watch it work — and if whatever is
-reading it goes away (`shortleash run … | head -1`), the echo stops but the
-caps keep being checked; the receipt notes it. A reader that merely
-*stalls* (a paused pager, a pipe nobody drains) cannot blind the caps
-either: every line is parsed first and handed to the echo through a bounded
-queue (4 MB) on a thread of its own. When the queue is full lines are
-dropped, never waited for, and the receipt counts them (`warning: the
-reader of our stdout was not keeping up: N line(s) of the agent's output
-were not echoed`). If that reader is still stuck when the run ends, the
-leash gives up on it after two seconds without progress, so the summary and
-the exit code are not held hostage. Non-JSON lines on that
-stdout (warnings, entrypoint chatter) are not telemetry and are ignored; a
-telemetry event whose fields are malformed (`"input_tokens": "abc"`) trips
-the run — the guard fails closed rather than guess.
+automatically (the guard needs the telemetry stream) — unless you pass
+`--output-format` yourself, as `--output-format json` or
+`--output-format=json`: your choice is kept, and what the leash can then do
+depends on what the agent prints (see *Live, or only afterwards*).
+
+The agent's stdout is echoed to yours so you still watch it work, but the
+echo is a best-effort copy, not the original bytes. The leash reads the
+output as UTF-8 text, a line at a time: a byte that is not valid UTF-8 comes
+out as U+FFFD (the replacement character), a carriage return or CR LF ends a
+line and comes out as a plain `\n` (a progress bar that redraws with `\r`
+becomes many lines), and a console whose code page lacks a character shows
+`?` in its place. On Windows the echo is written in text mode, so each line
+ends in CR LF instead. Claude Code's JSON lines are unaffected by the first
+two (a JSON parser reads the extra CR as white space).
+The caps are checked on what the leash parsed, never on the echo.
+
+If whatever is reading our stdout goes away (`shortleash run … | head -1`),
+the echo stops but the caps keep being checked; the receipt notes it. A
+reader that merely *stalls* (a paused pager, a pipe nobody drains) cannot
+blind the caps either: every line is parsed first and handed to the echo
+through a bounded queue (4 MB) on a thread of its own. When the queue is
+full — a stalled reader, or output arriving faster than a reader can take it
+(61 MB in about a second into `wc -c` echoed only about 5 MB) — lines are
+dropped, never waited for, and the receipt counts them (`warning: the reader
+of our stdout was not keeping up: N line(s) of the agent's output were not
+echoed`). If that reader is still stuck when the run ends, the leash gives
+up on it after two seconds without progress, so the summary and the exit
+code are not held hostage.
+
+Non-JSON lines on the agent's stdout (warnings, entrypoint chatter) are not
+telemetry and are ignored; a telemetry event whose fields are malformed
+(`"input_tokens": "abc"`) trips the run — the guard fails closed rather than
+guess.
 
 `--receipt path.json` creates a missing directory, and a path that cannot
 be written to at all is refused *before* the agent starts (exit `2`) — not
@@ -120,8 +138,10 @@ baseline anything — it would be stopped again on every attempt. That is
 why anomaly mode is off unless you ask for it, and why the STOPPED line
 tells you the way out: run the task once without `--anomaly` (it is then
 recorded and the median moves), or give it its own baseline with
-`--profile big-refactor`. Tune with `--anomaly 5.0` and `--min-history 10`.
-`--no-anomaly` is still accepted (it is the default). Until the history is
+`--profile big-refactor`. Tune with `--anomaly 5.0` and `--min-history 10`
+(`--min-history` is at least `1`: `0` is refused with exit `2`, where before
+0.1.2 it was a traceback). `--no-anomaly` is still accepted (it is the
+default). Until the history is
 long enough, anomaly mode is **not armed** and enforces nothing: the
 receipt says so (`anomaly:   not armed (2 of 5 runs) — nothing was enforced
 by it`, a `warning:` line, and `"anomaly": {"armed": false, "runs": 2,
@@ -181,13 +201,21 @@ design; the receipt warns about it instead of waiting forever.
 | code | meaning |
 |---|---|
 | `124` | a cap tripped and the tree was killed (mirrors `timeout(1)`) — or a cap turned out to be exceeded only in the agent's *final report*, after the run had ended (`EXCEEDED:` in the receipt, `breach_live: false`; see *Live, or only afterwards*) |
-| `125` | a budget/token/spawn/anomaly cap was requested but there was nothing to enforce it against: the child produced **no usage telemetry**, or — for the spawn cap — no per-message events. The cap could not have been enforced (see *Trust boundary*) |
+| `125` | a budget/token/spawn/anomaly cap was requested but there was nothing to enforce it against: the child produced **no usage telemetry** (a `usage` block with none of the token fields the leash reads counts as none: see *No telemetry, no comfort*), or — for the spawn cap — no per-message events. The cap could not have been enforced (see *Trust boundary*) |
 | `130` / `143` / `129` / `131` | the leash itself got Ctrl-C / SIGTERM / SIGHUP / SIGQUIT (Ctrl-Break on Windows is `143`) — at any point, the wait for stray children after the agent exited included; tree killed, receipt written |
 | `1` | the process exited 0 but its final stream-json `result` said `is_error: true` (`FAILED:` in the receipt, e.g. "Not logged in") |
 | `128+N` | POSIX: the child was killed by signal N outside any breach (what a shell would report) |
 | `126` | the command was found but could not be started (a directory, no execute permission, not an executable file, a path through a file): one `shortleash: error: cannot start …` line and no receipt, as nothing ran. Before 0.1.1 this was a traceback and exit `1` |
 | `2` | usage error, command not found, unsafe `.cmd` launch refused, receipt path not writable |
 | other | the child's own exit code (on Windows its 32-bit status, clamped to 0–255; the raw value is `child_returncode` in the receipt) |
+
+The last row includes a command that itself exits `124`, `125`, `126` or
+`143`: by exit code alone that looks like the leash's own verdict of the same
+number. The receipt tells them apart. `breached` is `true` only when the
+leash ended the run, found a cap exceeded afterwards or was signalled itself;
+`not_enforced` lists the caps behind a `125` of the leash's; and
+`child_returncode` is what the command itself returned (`0` behind such a
+`125`). The leash's own `126` writes no receipt at all.
 
 ## The receipt
 
@@ -285,6 +313,16 @@ enforce a cost cap against. It says so instead of pretending:
 The exit code is `125` in that case (the run itself may have succeeded,
 but the cap you asked for never held), the cost is `null` rather than
 `$0.00`, and the run is not added to the anomaly history.
+
+The leash reads four fields of a `usage` block as token counts:
+`input_tokens`, `output_tokens`, `cache_creation_input_tokens` and
+`cache_read_input_tokens`. A block that has fields but none of those fields
+(another agent's `prompt_tokens`, say) counts as no usage, not as zero
+tokens: the receipt carries a `warning:` naming the fields it could not read,
+a cap that needed token counts is listed under `not_enforced`, and the exit
+code is `125`. A reported `total_cost_usd` still backs `--budget`. Before
+0.1.2 such a block counted as zero tokens, so `--max-tokens 100` and a report
+of 5,000,000 tokens in other words ended `finished within guardrails`.
 
 ### Live, or only afterwards
 
@@ -407,6 +445,13 @@ cache-optimal layout and emits integration snippets for Anthropic (explicit
 `cache_control` breakpoints), OpenAI/DeepSeek (automatic prefix caching),
 and Gemini (explicit context caching).
 
+The prompt file is read as UTF-8 (with or without a byte-order mark) or, when
+it starts with a byte-order mark, as UTF-16 or UTF-32 (PowerShell 5's `>`
+writes UTF-16); the prompt `-o` writes is plain UTF-8. A file in any other
+encoding, a file that cannot be read and an output path that cannot be
+written are each one `error:` line and exit `2`. (Before 0.1.2 the first and
+the last were a traceback and exit `1`.)
+
 ## Testing
 
 ```bash
@@ -422,7 +467,7 @@ returns and kills the whole tree, sends the leash itself Ctrl-C and SIGTERM
 at a temp dir). The Windows shim resolution and the cmd.exe refusal list
 are unit-tested with a fake shim directory on every platform.
 
-## Scope / limits (v0.1.1)
+## Scope / limits (v0.1.2)
 
 - Claude Code `-p` (non-interactive) is the supported path. Interactive
   sessions and other agents (Codex, Cursor) are on the roadmap — the
@@ -438,12 +483,16 @@ are unit-tested with a fake shim directory on every platform.
 - **SIGKILL of the leash cannot be handled** (no receipt). On Linux the
   agent is asked to die with it, but only the agent itself, not what it
   spawned; macOS has no equivalent; Windows relies on the Job Object.
-- **A reader of our stdout that stops reading** costs the echo, not the
-  caps: lines are dropped (and counted) once 4 MB are queued, and the leash
-  stops waiting for that reader two seconds after its last progress. Until
-  then the leash's own exit can wait for it.
+- **A reader of our stdout that stops reading, or cannot keep up with a
+  burst,** costs the echo, not the caps: lines are dropped (and counted)
+  once 4 MB are queued, and the leash stops waiting for that reader two
+  seconds after its last progress. Until then the leash's own exit can wait
+  for it. The echo is a best-effort copy of the output (see *Usage*).
 - **Windows:** SIGHUP and SIGQUIT do not exist there; Ctrl-Break and the
   kill-on-close Job Object are what apply. The signal, echo-thread and
-  exit-code changes of 0.1.1 were written to be platform-neutral and are
-  covered by tests that run on Windows too, but they were developed and run
-  on Linux only.
+  exit-code changes of 0.1.1, and the changes of 0.1.2 (UTF-16 prompt files
+  for `cache`, `--output-format=`, `--min-history`, usage blocks the leash
+  cannot read, the echo wording), were written to be platform-neutral and are
+  covered by tests that run on Windows too (the suite passes there on Python
+  3.11), but they were developed on Linux: no file written by a real
+  PowerShell 5 was read.

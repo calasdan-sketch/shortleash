@@ -124,10 +124,12 @@ def _read_pid(path: str, seconds: float = 10.0) -> int:
 
 def _leash(*args: str, stdout=subprocess.DEVNULL, stderr=None):
     """The leash as a real subprocess, in its own session so a signal
-    aimed at it never reaches this test process."""
+    aimed at it never reaches this test process; it starts with the default
+    signals, whatever the test runner was started with."""
     return subprocess.Popen([PY, "-m", "shortleash", "run", *args],
                             cwd=REPO, stdout=stdout, stderr=stderr,
-                            start_new_session=True)
+                            start_new_session=True,
+                            preexec_fn=_isolate.DEFAULT_SIGNALS)
 
 
 def _run_guard(guard: Guard, argv: list[str]) -> tuple[int, dict, str]:

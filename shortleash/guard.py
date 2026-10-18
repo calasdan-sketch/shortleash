@@ -6,8 +6,9 @@ Design:
   the whole tree, never our own group.
 - A monitor thread reads the child's stdout line-by-line, parses
   stream-json events and checks caps after each observation; it hands
-  every line to an echo thread (_EchoPump) that passes it through to our
-  stdout, so the user still watches the agent work. Parsing never waits
+  every line to an echo thread (_EchoPump) that copies it to our stdout
+  (best effort, as UTF-8 text: a CR becomes a newline, a bad byte U+FFFD),
+  so the user still watches the agent work. Parsing never waits
   for the echo: a reader of OUR stdout that stalls (a paused pager, a
   full pipe) must not blind the caps, so the hand-over is a bounded queue
   that drops lines (and says so) rather than block. If our stdout goes
@@ -45,7 +46,8 @@ Design:
   timeout(1)) and when a cap was found exceeded only after the fact; 125 when a
   telemetry-dependent cap was requested but there was nothing to enforce
   it against (no usage telemetry at all, or -- for the spawn cap -- no
-  per-message events); 130/143 on Ctrl-C/SIGTERM; 1 when the agent's
+  per-message events; a usage block with none of the token fields the
+  leash reads counts as no usage); 130/143 on Ctrl-C/SIGTERM; 1 when the agent's
   final result says is_error although the process exited 0; a child
   killed by signal N outside a breach is 128+N like a shell; otherwise
   the child's exit code.
@@ -354,7 +356,10 @@ class Guard:
                     if key not in self._seen_spawns:
                         self._seen_spawns.add(key)
                         self.spawns += 1
-            self.usage_events += 1
+            if not obs.get("usage_unreadable"):
+                # (an event whose usage block the leash cannot read is not
+                # usage telemetry: it must not make a token cap look live)
+                self.usage_events += 1
 
     def estimated_cost(self) -> float:
         with self._lock:
@@ -598,6 +603,8 @@ class Guard:
     def _handle_obs(self, obs: dict) -> dict:
         """Process one parsed observation. Returns the obs; trips on breach."""
         kind = obs["kind"]
+        if obs.get("usage_unreadable"):
+            self._note_unreadable_usage(obs["usage_unreadable"])
         if kind == "init":
             with self._lock:
                 self.model = obs.get("model") or self.model
@@ -633,6 +640,16 @@ class Guard:
                     self.agent_error_text = (obs.get("error_text")
                                              or obs.get("subtype") or "")
         return obs
+
+    def _note_unreadable_usage(self, names: list[str]) -> None:
+        """Say, once, that a usage block was ignored and why."""
+        note = (f"usage report ignored: its fields ({', '.join(names)}) "
+                f"include none of {', '.join(events.TOKEN_FIELDS)}, so no "
+                f"token count was read from it and a cap that needs one "
+                f"could not be checked")
+        with self._lock:
+            if note not in self.warnings:
+                self.warnings.append(note)
 
     def _watchdog(self) -> None:
         if self.timeout is None:

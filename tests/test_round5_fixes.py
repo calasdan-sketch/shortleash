@@ -282,7 +282,10 @@ SLEEPING_AGENT = (
 
 def _leash(*args: str, stdout=subprocess.DEVNULL, stderr=None, preexec=None):
     """The leash as a real subprocess in its own session, so a signal aimed
-    at it never reaches this test process."""
+    at it never reaches this test process. Unless the caller brings its own
+    preexec (the nohup test), it starts with the default signals."""
+    if preexec is None:
+        preexec = _isolate.DEFAULT_SIGNALS
     return subprocess.Popen([PY, "-m", "shortleash", "run", *args], cwd=REPO,
                             stdout=stdout, stderr=stderr, env=_child_env(),
                             start_new_session=True, preexec_fn=preexec)

@@ -13,6 +13,7 @@ the verified provider docs.
 
 from __future__ import annotations
 
+import codecs
 import re
 
 PLACEHOLDER_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
@@ -36,6 +37,48 @@ CACHE_DOCS = [
      "Automatic prefix caching on repeated prefixes; 50% off. "
      "Stable prefix first, same as OpenAI."),
 ]
+
+
+# The byte-order marks a prompt file may start with. The UTF-32 LE mark begins
+# with the UTF-16 LE mark, so the UTF-32 ones are tried first. The "utf-8-sig",
+# "utf-16" and "utf-32" codecs consume the mark: it is not part of the prompt.
+_BOMS = (
+    (codecs.BOM_UTF32_LE, "utf-32", "UTF-32"),
+    (codecs.BOM_UTF32_BE, "utf-32", "UTF-32"),
+    (codecs.BOM_UTF8, "utf-8-sig", "UTF-8"),
+    (codecs.BOM_UTF16_LE, "utf-16", "UTF-16"),
+    (codecs.BOM_UTF16_BE, "utf-16", "UTF-16"),
+)
+
+_EXPECTED = ("expected UTF-8, or UTF-16/UTF-32 with a byte-order mark - "
+             "re-save the file as UTF-8")
+
+
+def decode_prompt(data: bytes) -> str:
+    """Decode the bytes of a prompt file.
+
+    UTF-8 (with or without a byte-order mark) is read, and so are UTF-16 and
+    UTF-32 files that start with a mark (PowerShell 5's `>` writes UTF-16 LE
+    with one). Every line ending comes out as a single newline character, as
+    reading a text file always did. Anything else raises ValueError, whose
+    message completes the sentence "<file> ..." and says what was expected: a
+    file in some other encoding would otherwise be analysed, and rewritten,
+    as garbage."""
+    codec, label = "utf-8", "UTF-8"
+    for mark, mark_codec, mark_label in _BOMS:
+        if data.startswith(mark):
+            codec, label = mark_codec, mark_label
+            break
+    try:
+        text = data.decode(codec)
+    except UnicodeDecodeError as e:
+        raise ValueError(f"is not valid {label} text ({e.reason} at byte "
+                         f"{e.start}); {_EXPECTED}") from None
+    if "\x00" in text:
+        # UTF-16 without a mark: every other byte is NUL, which is valid UTF-8
+        raise ValueError("contains NUL characters (UTF-16 without a "
+                         f"byte-order mark?); {_EXPECTED}")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def find_placeholders(text: str) -> list[str]:

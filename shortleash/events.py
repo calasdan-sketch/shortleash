@@ -27,6 +27,10 @@ Gotchas handled:
 - `result.subtype` "success" can lie; `is_error` is authoritative. The guard
   treats a result with `is_error: true` as a failed run (exit 1 when the
   child itself exited 0) and says so in the receipt.
+- A `usage` block with fields but none of the four token fields below is
+  not usage: it would count as zero tokens, and a token cap would pass on
+  evidence that says nothing. The observation carries `usage_unreadable`
+  (the names of its fields) instead, and a `result` then has `usage: None`.
 - Hook noise (system/hook_started, hook_response, api_retry) is ignored.
 - Non-JSON lines (warnings, entrypoint chatter) are skipped, never fatal.
 """
@@ -37,6 +41,23 @@ import json
 
 #: tool_use block names that mean "a subagent was spawned".
 SPAWN_TOOL_NAMES = frozenset({"Agent", "Task"})
+
+#: The only usage fields that are token counts to the leash.
+TOKEN_FIELDS = ("input_tokens", "output_tokens",
+                "cache_creation_input_tokens", "cache_read_input_tokens")
+
+#: At most this many field names of an unreadable block are kept (they go
+#: into a warning; never store a whole foreign blob).
+MAX_UNREADABLE_NAMES = 8
+
+
+def unreadable_usage(raw) -> list[str] | None:
+    """The field names of a `usage` block that is there, has fields, and has
+    none of TOKEN_FIELDS (sorted, bounded) -- or None when the block is
+    readable, empty or absent."""
+    if isinstance(raw, dict) and raw and not any(k in raw for k in TOKEN_FIELDS):
+        return sorted(str(k) for k in raw)[:MAX_UNREADABLE_NAMES]
+    return None
 
 
 def _usage_of(message: dict) -> dict:
@@ -94,6 +115,7 @@ def parse_line(line: str) -> dict | None:
             "kind": "usage",
             "message_id": str(message.get("id") or ""),
             "usage": _usage_of(message),
+            "usage_unreadable": unreadable_usage(message.get("usage")),
             "spawns": len(spawn_ids),
             "spawn_ids": spawn_ids,
         }
@@ -106,9 +128,12 @@ def parse_line(line: str) -> dict | None:
             "is_error": bool(ev.get("is_error")),
             "subtype": ev.get("subtype") or "",
             "num_turns": int(ev.get("num_turns") or 0),
-            # The run's final totals, or None when the report has none.
+            # The run's final totals, or None when the report has none (or
+            # none the leash can read: see unreadable_usage).
             "usage": (_usage_of({"usage": ev["usage"]})
-                      if isinstance(ev.get("usage"), dict) else None),
+                      if isinstance(ev.get("usage"), dict)
+                      and unreadable_usage(ev["usage"]) is None else None),
+            "usage_unreadable": unreadable_usage(ev.get("usage")),
             "session_id": ev.get("session_id") or "",
             # The error message when is_error is set ("Not logged in", ...).
             # Bounded: never store a whole final answer in the receipt.

@@ -118,10 +118,12 @@ def _read_pid(path: str, seconds: float = 15.0) -> int:
 
 def _leash(*args: str, stdout=subprocess.DEVNULL, stderr=None):
     """The leash as a real subprocess, in its own session so a signal
-    aimed at it never reaches this test process."""
+    aimed at it never reaches this test process; it starts with the default
+    signals, whatever the test runner was started with."""
     return subprocess.Popen([PY, "-m", "shortleash", "run", *args],
                             cwd=REPO, stdout=stdout, stderr=stderr,
-                            start_new_session=True)
+                            start_new_session=True,
+                            preexec_fn=_isolate.DEFAULT_SIGNALS)
 
 
 def _run_guard(guard: Guard, argv: list[str]) -> tuple[int, dict | None, str]:
@@ -212,6 +214,9 @@ class TestSignalInStragglerWindow(unittest.TestCase):
                 raise KeyboardInterrupt()
             return real_join(self_guard, monitor, timeout)
 
+        # (what the runner had: a background job or nohup hands SIGINT down
+        # as "ignored", and that is what must be back afterwards)
+        before = signal.getsignal(signal.SIGINT)
         g = Guard(budget=50.0, grace_period=4.0, quiet=True)
         with mock.patch.object(Guard, "_join_monitor", interrupting_join):
             code, rec, _ = _run_guard(g, [PY, "-c", ESCAPER_CHILD, pidfile])
@@ -222,7 +227,7 @@ class TestSignalInStragglerWindow(unittest.TestCase):
         gpid = _read_pid(pidfile)
         self.assertTrue(_wait_dead(gpid, 10), "grandchild survived")
         self.assertEqual(signal.getsignal(signal.SIGINT),
-                         signal.default_int_handler)  # restored afterwards
+                         before)  # restored afterwards
 
 
 # ---------------------------------------------------------------------

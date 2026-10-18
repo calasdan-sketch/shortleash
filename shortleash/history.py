@@ -143,7 +143,9 @@ def baseline(agent: str, profile: str = "",
     not normal. Corrupt lines are skipped; a note is appended to
     ``warnings`` (when given) saying how many."""
     costs, tokens = _runs(agent, profile, path, warnings)
-    if len(costs) < min_runs:
+    if not costs or len(costs) < min_runs:
+        # (a baseline is a median: with no past run at all there is none,
+        # whatever min_runs says)
         return None
     return {
         "median_cost": statistics.median(costs),

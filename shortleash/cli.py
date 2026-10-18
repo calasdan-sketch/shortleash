@@ -92,7 +92,8 @@ def _add_run_parser(sub) -> None:
     r.add_argument("--history-path", type=str, default=None,
                    help="History file (default ~/.shortleash/history.jsonl).")
     r.add_argument("--min-history", type=int, default=5,
-                   help="Past runs needed before anomaly mode arms.")
+                   help="Past runs needed before anomaly mode arms (at least "
+                        "1: the baseline is the median of them; default 5).")
     r.add_argument("--fleet", action="store_true",
                    help="Hold a fleet claim on paths for the run (merged "
                         "from claimlock): warns on conflict, releases on "
@@ -150,16 +151,23 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _has_flag(argv: list[str], flag: str) -> bool:
+    """Is `flag` given, as `--flag VALUE` or as `--flag=VALUE`?"""
+    return any(a == flag or a.startswith(flag + "=") for a in argv)
+
+
 def _maybe_inject_stream_json(argv: list[str]) -> list[str]:
     """If wrapping `claude` without stream-json flags, add them.
 
     The guard needs the telemetry stream to enforce caps. This keeps the
     common case to: shortleash run --budget 2 -- claude -p "do thing"
+    A format the user chose (`--output-format json` or `--output-format=json`)
+    is left alone.
     """
     if not argv:
         return argv
     prog = guard_mod.agent_name(argv[0])
-    if prog == "claude" and "--output-format" not in argv:
+    if prog == "claude" and not _has_flag(argv, "--output-format"):
         return argv + ["--output-format", "stream-json", "--verbose"]
     return argv
 
@@ -169,10 +177,15 @@ def _cmd_cache(args) -> int:
         print(cacheopt.guide_text())
         return 0
     try:
-        with open(args.in_file, encoding="utf-8") as f:
-            text = f.read()
+        with open(args.in_file, "rb") as f:
+            data = f.read()
     except OSError as e:
         print(f"error: can't read {args.in_file}: {e}", file=sys.stderr)
+        return 2
+    try:
+        text = cacheopt.decode_prompt(data)
+    except ValueError as e:
+        print(f"error: {args.in_file} {e}", file=sys.stderr)
         return 2
     if args.cache_cmd == "check":
         a = cacheopt.analyze(text)
@@ -202,8 +215,12 @@ def _cmd_cache(args) -> int:
         out += ["", f"  ── {prov} ──", cacheopt.provider_snippet(prov)]
     rendered = "\n".join(out)
     if args.out_file:
-        with open(args.out_file, "w", encoding="utf-8") as f:
-            f.write(optimized)
+        try:
+            with open(args.out_file, "w", encoding="utf-8") as f:
+                f.write(optimized)
+        except OSError as e:
+            print(f"error: can't write {args.out_file}: {e}", file=sys.stderr)
+            return 2
         print(rendered)
         print(f"\n  optimized prompt written to {args.out_file}")
     else:
@@ -337,6 +354,10 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"--timeout must be > 0 seconds (got {args.timeout:g})")
         if args.anomaly is not None and args.anomaly <= 0:
             parser.error(f"--anomaly must be > 0 (got {args.anomaly:g})")
+        # The baseline is the median of the past runs: there is none to take
+        # from zero of them.
+        if args.min_history < 1:
+            parser.error(f"--min-history must be >= 1 (got {args.min_history})")
         if args.no_anomaly:
             args.anomaly = None
         # argparse puts everything after `--` in `command`, possibly
