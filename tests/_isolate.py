@@ -27,6 +27,9 @@ os.makedirs(TEST_HOME)
 os.environ["SHORTLEASH_HOME"] = os.path.join(TEST_HOME, ".shortleash")
 os.environ["HOME"] = TEST_HOME
 os.environ["USERPROFILE"] = TEST_HOME
+# `run` reads $SHORTLEASH_PRICING when --pricing is not given: a pricing file
+# in the developer's own shell (or a broken one) must not change what a test sees.
+os.environ.pop("SHORTLEASH_PRICING", None)
 
 
 def _default_signals():

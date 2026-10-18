@@ -17,8 +17,8 @@ Grouping key: the agent binary name (argv[0] basename), overridable with
 --profile. Minimum history (default 5 runs) before anomaly mode arms --
 until then only static caps apply.
 
-A corrupt history line (bad JSON, a non-numeric cost) is skipped with a
-warning; it must never stop the agent from starting.
+A corrupt history line (bad JSON, a non-numeric cost, a byte that is not
+UTF-8) is skipped with a warning; it must never stop the agent from starting.
 """
 
 from __future__ import annotations
@@ -77,7 +77,13 @@ def _key(entry: dict) -> str:
 
 def _parse_entry(line: str) -> tuple[str, float, int, bool] | None:
     """(key, cost, tokens, breached) from one history line, or None when
-    the line is not a well-formed entry (bad JSON, non-numeric fields)."""
+    the line is not a well-formed entry (bad JSON, non-numeric fields, a byte
+    that is not UTF-8: _runs reads the file with errors="surrogateescape", so
+    such a byte arrives here as a lone surrogate)."""
+    try:
+        line.encode("utf-8")
+    except UnicodeEncodeError:
+        return None  # a torn write or a hand edit left a damaged line
     try:
         e = json.loads(line)
     except ValueError:
@@ -105,7 +111,10 @@ def _runs(agent: str, profile: str, path: str | None,
     tokens: list[int] = []
     skipped = 0
     try:
-        with open(path, encoding="utf-8") as f:
+        # surrogateescape: a byte that is not UTF-8 must not stop the read
+        # (UnicodeDecodeError would escape every handler here); _parse_entry
+        # counts such a line as corrupt.
+        with open(path, encoding="utf-8", errors="surrogateescape") as f:
             for line in f:
                 line = line.strip()
                 if not line:

@@ -1,0 +1,7 @@
+# The sdist carries the tests and the fake agent they run, so that
+# `python -m unittest discover -s tests` works in the unpacked archive
+# (the tests import tests/_isolate.py and start sim/runaway.py).
+graft tests
+graft sim
+# `graft` takes whatever lies in the directory, test-run caches included.
+global-exclude *.py[cod]

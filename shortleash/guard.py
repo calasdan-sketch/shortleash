@@ -238,13 +238,14 @@ def _say(text: str) -> None:
 
 
 def agent_name(argv0: str) -> str:
-    """Basename of the agent binary without a Windows executable suffix
-    ('C:\\tools\\claude.cmd' -> 'claude'), so history baselines and the
-    receipt use the same key on every platform."""
-    name = os.path.basename(argv0.replace("\\", "/"))
-    low = name.lower()
+    """Basename of the agent binary in lower case, without a Windows
+    executable suffix ('C:\\tools\\Claude.CMD' -> 'claude'), so history
+    baselines, the receipt and the "is this claude?" test use the same key on
+    every platform. Windows and macOS file systems are case-insensitive:
+    `Claude` and `CLAUDE.EXE` start the very same program as `claude`."""
+    name = os.path.basename(argv0.replace("\\", "/")).casefold()
     for suf in _EXE_SUFFIXES:
-        if low.endswith(suf) and len(name) > len(suf):
+        if name.endswith(suf) and len(name) > len(suf):
             return name[: -len(suf)]
     return name
 

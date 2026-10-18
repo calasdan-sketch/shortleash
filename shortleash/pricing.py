@@ -9,8 +9,9 @@ PRICING_AS_OF — they are NOT fetched from anywhere and are not verified
 against the providers' current price lists. Verify them against the
 provider pricing page before trusting a --budget to the cent, and
 override them with --pricing FILE or the SHORTLEASH_PRICING env var
-(both: a JSON file, see load_table). The final receipt always prefers
-the agent-reported total_cost_usd when present.
+(both: a JSON file, see load_table; UTF-8, or UTF-16/UTF-32 with a
+byte-order mark, as Windows tools write them). The final receipt always
+prefers the agent-reported total_cost_usd when present.
 
 Pricing JSON format (USD per 1M tokens, [input, output]):
 
@@ -31,6 +32,8 @@ import dataclasses
 import json
 import math
 import os
+
+from . import textfile
 
 #: Date the hard-coded table below was written. Nothing updates it
 #: automatically: when you change a number, change this too.
@@ -119,8 +122,13 @@ def load_table(path: str | None = None,
     source_path = path or env.get(PRICING_ENV) or None
     if not source_path:
         return PricingTable(rates=dict(DEFAULT_PRICING))
-    with open(source_path, encoding="utf-8") as f:
-        data = json.load(f)
+    with open(source_path, "rb") as f:
+        raw = f.read()
+    try:
+        text = textfile.decode_text(raw)
+    except ValueError as e:
+        raise ValueError(f"the file {e}") from None
+    data = json.loads(text)
     rates = dict(DEFAULT_PRICING)
     overrides: dict = {}
     as_of = _parse_rates(data, rates, source_path, overrides)

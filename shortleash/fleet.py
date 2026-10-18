@@ -8,16 +8,23 @@ with TTL as the backstop for hard kills.
 Deliberately minimal: claim/release/overlap/TTL. No broadcasts, no
 fleet-wide messaging (unauthenticated injection channel — killed on
 purpose).
+
+The claims live in a SQLite database, and `sqlite3` is imported only when the
+fleet is first used (see _sqlite3): a Python built without it (some pyenv and
+Alpine builds) must still run everything else, `--version` included.
 """
 
 from __future__ import annotations
 
 import os
-import sqlite3
 import time
 import uuid
+from typing import TYPE_CHECKING
 
 from . import paths
+
+if TYPE_CHECKING:  # annotations only: the real import is lazy, see _sqlite3()
+    import sqlite3
 
 #: Explicit override hook for the DB location (tests, embedding). When
 #: None, the path comes from paths.fleet_db_path() — i.e. ~/.shortleash
@@ -25,6 +32,33 @@ from . import paths
 DB_PATH: str | None = None
 DEFAULT_TTL = 1800  # 30 minutes
 MAX_TTL = 86400  # 24 hours
+
+
+class FleetUnavailable(Exception):
+    """Fleet claims cannot work in this Python: it has no `sqlite3` module.
+    The message says so and is meant to be shown as it is."""
+
+
+def _sqlite3():
+    """The `sqlite3` module, imported on first use, or FleetUnavailable."""
+    try:
+        import sqlite3
+    except ImportError as e:  # no _sqlite3 C module in this Python build
+        raise FleetUnavailable(
+            f"fleet claims need Python's sqlite3 module, and this Python was "
+            f"built without it ({e})") from None
+    return sqlite3
+
+
+def db_errors() -> tuple:
+    """The exceptions that mean "the fleet database cannot be used" (a corrupt
+    file, a directory that cannot be written): what connect() and the claim
+    functions raise for reasons of their own."""
+    try:
+        return (_sqlite3().Error, OSError)
+    except FleetUnavailable:
+        return (OSError,)
+
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -43,6 +77,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_cid ON claims(claim_id);
 
 
 def connect(db_path: str | None = None) -> sqlite3.Connection:
+    sqlite3 = _sqlite3()
     # NB: resolve the path at call time, not as a default arg — a default
     # arg would bind the value at import and ignore $SHORTLEASH_HOME or a
     # later DB_PATH reassignment.

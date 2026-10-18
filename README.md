@@ -47,10 +47,15 @@ can never trip must not be listed as enforced (before 0.1.1 `--budget nan`
 ran the agent unguarded and the receipt called the budget enforced).
 
 When wrapping `claude`, `--output-format stream-json --verbose` are added
-automatically (the guard needs the telemetry stream) — unless you pass
+automatically (the guard needs the telemetry stream), unless you pass
 `--output-format` yourself, as `--output-format json` or
 `--output-format=json`: your choice is kept, and what the leash can then do
-depends on what the agent prints (see *Live, or only afterwards*).
+depends on what the agent prints (see *Live, or only afterwards*). `claude` is
+recognised by its file name in any letter case, with or without a Windows
+executable suffix (`.exe`, `.cmd`, `.bat`, `.com`, `.ps1`). The file systems
+of Windows and macOS are normally case-insensitive, so `Claude` and
+`CLAUDE.EXE` start the very program `claude` does; before 0.1.3 a capital
+letter in the name itself (`Claude`) kept the flags off.
 
 The agent's stdout is echoed to yours so you still watch it work, but the
 echo is a best-effort copy, not the original bytes. The leash reads the
@@ -69,12 +74,12 @@ reader that merely *stalls* (a paused pager, a pipe nobody drains) cannot
 blind the caps either: every line is parsed first and handed to the echo
 through a bounded queue (4 MB) on a thread of its own. When the queue is
 full — a stalled reader, or output arriving faster than a reader can take it
-(61 MB in about a second into `wc -c` echoed only about 5 MB) — lines are
-dropped, never waited for, and the receipt counts them (`warning: the reader
-of our stdout was not keeping up: N line(s) of the agent's output were not
-echoed`). If that reader is still stuck when the run ends, the leash gives
-up on it after two seconds without progress, so the summary and the exit
-code are not held hostage.
+— lines are dropped, never waited for, and the receipt counts them (`warning:
+the reader of our stdout was not keeping up: N line(s) of the agent's output
+were not echoed`). How much of a fast burst still gets through depends on the
+reader and the machine; no amount is promised. If that reader is still stuck
+when the run ends, the leash gives up on it after two seconds without
+progress, so the summary and the exit code are not held hostage.
 
 Non-JSON lines on the agent's stdout (warnings, entrypoint chatter) are not
 telemetry and are ignored; a telemetry event whose fields are malformed
@@ -86,6 +91,12 @@ be written to at all is refused *before* the agent starts (exit `2`) — not
 discovered after the money was spent. Should the write still fail at the
 end (disk full), the receipt summary is printed on stderr instead, with a
 warning, even under `--quiet`.
+
+`--quiet` keeps the leash's own commentary off stderr: the startup banner, the
+receipt text and the one-line notices (a model whose price is a guess, the id
+of a fleet claim). The agent's output is still echoed, the JSON that
+`--receipt` writes is still written, and errors and fleet warnings are still
+printed.
 
 ### Stopping the leash (Ctrl-C, SIGTERM, SIGHUP, SIGQUIT)
 
@@ -121,6 +132,11 @@ every run with telemetry is appended to `~/.shortleash/history.jsonl` (or
 under `$SHORTLEASH_HOME`; no command text or prompt is stored there), and
 with `--anomaly` the guard trips once an agent has 5+ past runs and the
 live run exceeds **3× the historical median** cost or tokens for that agent.
+Runs are grouped by the agent's name, the command's file name in lower case
+without `.exe`, `.cmd`, `.bat`, `.com` or `.ps1` (`Claude.EXE` and `claude`
+share a baseline), or by `--profile NAME` when you give one.
+`--history-path FILE` keeps the history in FILE instead: runs are recorded
+there, and the baseline is read from there.
 
 ```bash
 shortleash run --anomaly -- claude -p "migrate the database layer"
@@ -148,6 +164,13 @@ by it`, a `warning:` line, and `"anomaly": {"armed": false, "runs": 2,
 "min_runs": 5, …}` in the JSON) and never lists `anomaly` under
 `enforced`.
 
+A history line that cannot be used (not valid JSON, not valid UTF-8, a figure
+that is not a usable number) is skipped and is never a reason not to start the
+agent: the receipt carries a `warning:` saying `history: skipped N corrupt
+line(s) in FILE`. Before 0.1.3 a single byte that was not UTF-8, left by a
+torn write or a hand edit, ended `run --anomaly` in a traceback before the
+agent started.
+
 ### Fleet mode (`--fleet`)
 
 Running several agents on the same machine? `--fleet` holds a **fleet
@@ -155,7 +178,8 @@ claim** on paths for the run — a lockfile for agents, merged from the
 retired claimlock:
 
 ```bash
-shortleash run --fleet --budget 3 -- claude -p "refactor the api layer"
+shortleash run --fleet --fleet-owner dan --budget 3 -- \
+  claude -p "refactor the api layer"
 # [shortleash] fleet claim ce63a732a87b: /home/dan/project
 shortleash fleet list
 # ce63a732a87b  /home/dan/project  held by dan  (1791s left)  — shortleash run: claude
@@ -167,7 +191,12 @@ shortleash fleet list
   overlapping path, you get a loud stderr warning and the run proceeds
   anyway — a lock must never be a deadlock.
 - Released automatically on exit (normal, Ctrl-C/SIGTERM, or crash via the
-  TTL backstop). Tune with `--fleet-owner "dan"` and `--fleet-ttl 3600`.
+  TTL backstop). Tune with `--fleet-owner dan` and `--fleet-ttl 3600`.
+- `--fleet-owner` is the label `fleet list` shows after `held by`; without
+  it the claim reads `held by ?`. `--fleet-ttl` is in seconds, from 1 to 86400
+  (default 1800): a value outside that range is a usage error (exit `2`,
+  before anything runs, with or without `--fleet`). Before 0.1.3 a larger
+  value was silently cut down to 86400.
 - `shortleash fleet list` shows who holds what right now.
 - A claim is advisory, so a fleet database that cannot be used (a corrupt
   `fleet.db`, a home that cannot be written) is a warning, not a stop:
@@ -175,6 +204,13 @@ shortleash fleet list
   it in the receipt and runs the agent; `fleet list` prints one
   `shortleash: error:` line and exits `1`. Before 0.1.1 both were a
   traceback, and the run never started.
+- The claims live in a SQLite database, so fleet mode needs Python's
+  `sqlite3` module. A Python built without it (some pyenv and Alpine builds)
+  still runs everything else, `--version` and `run` without `--fleet`
+  included; before 0.1.3 even `--version` was an ImportError traceback.
+  There `run --fleet` takes the same advisory line as an unusable database
+  (a warning, `running WITHOUT a claim`, and the agent runs) and `fleet list`
+  prints one `shortleash: error:` line and exits `2`.
 
 ### Killing the tree
 
@@ -206,7 +242,7 @@ design; the receipt warns about it instead of waiting forever.
 | `1` | the process exited 0 but its final stream-json `result` said `is_error: true` (`FAILED:` in the receipt, e.g. "Not logged in") |
 | `128+N` | POSIX: the child was killed by signal N outside any breach (what a shell would report) |
 | `126` | the command was found but could not be started (a directory, no execute permission, not an executable file, a path through a file): one `shortleash: error: cannot start …` line and no receipt, as nothing ran. Before 0.1.1 this was a traceback and exit `1` |
-| `2` | usage error, command not found, unsafe `.cmd` launch refused, receipt path not writable |
+| `2` | usage error, command not found, unsafe `.cmd` launch refused, receipt path not writable, a pricing file that cannot be loaded, `fleet list` on a Python without `sqlite3` |
 | other | the child's own exit code (on Windows its 32-bit status, clamped to 0–255; the raw value is `child_returncode` in the receipt) |
 
 The last row includes a command that itself exits `124`, `125`, `126` or
@@ -228,6 +264,7 @@ Every run ends with a receipt on stderr and optionally as JSON
   tokens:    51,000 (in=15,000 out=4,500 cache_r=30,000 cache_w=1,500)
   turns:     0   spawns: 1
   duration:  0.16s   exit: 124
+  pricing:   built-in fallback table as of 2026-10-16 — verify against provider pricing
   STOPPED:   budget exceeded: estimated $0.1271 > $0.05 cap
 ──────────────────────────────────────────────────
 ```
@@ -267,13 +304,14 @@ recognised. The history file never stores command text.
 ### Prices are a hard-coded fallback — verify them
 
 The built-in table (`pricing.py`, USD per 1M tokens) is **not fetched from
-anywhere**; it was written on the date in `PRICING_AS_OF` and is printed in
-the startup banner and the receipt as
-`pricing: built-in fallback table as of 2026-10-16 — verify against
-provider pricing`. Check it against the provider's pricing page before
-trusting a `--budget` to the cent, and override it with `--pricing
-pricing.json` or the `SHORTLEASH_PRICING` environment variable pointing at a
-JSON file:
+anywhere**; it was written on the date in `PRICING_AS_OF`. The startup banner
+says so (`pricing: built-in fallback table as of 2026-10-16 — verify against
+provider pricing`; not under `--quiet`), the receipt on stderr repeats that
+line whenever the cost it shows is an estimate, and the JSON receipt always
+carries it (`pricing`: `as_of`, `source`). Check it against the provider's
+pricing page before trusting a `--budget` to the cent, and override it with
+`--pricing pricing.json` or the `SHORTLEASH_PRICING` environment variable
+pointing at a JSON file:
 
 ```json
 {"as_of": "2026-10-16",
@@ -290,6 +328,12 @@ built-in `opus` entry won and the override was silently ignored). Rates
 must be finite numbers >= 0 and a key must not be empty: `NaN`, `Infinity`,
 negative values and `""` are refused with exit `2` (a NaN rate would have
 let every run through).
+
+The file is read as UTF-8 (with or without a byte-order mark) or, when it
+starts with a byte-order mark, as UTF-16 or UTF-32: the same rule as the
+prompt files of `cache`, so what PowerShell 5's `>` or Notepad writes works.
+A file in any other encoding is one `error:` line and exit `2`. (Before 0.1.3
+only plain UTF-8 was read, and a mark or UTF-16 was refused.)
 
 A model that matches **no** entry is priced with the `default` entry
 (Sonnet's rate) — and the leash says so instead of guessing quietly: one
@@ -421,8 +465,9 @@ Be honest about what the guard can and can't see:
   then says `no usage data seen — only the wall-clock/time limit was
   enforced`, lists the caps that were NOT enforced, reports the cost as
   n/a, and exits `125` if such a cap was requested.
-- **Prices are a dated fallback table**, not live data: every receipt
-  prints its `as_of` date — verify against provider pricing.
+- **Prices are a dated fallback table**, not live data: the startup banner
+  and the JSON receipt carry its `as_of` date — verify against provider
+  pricing.
 
 Treat this as a guardrail against runaway cost, not a security boundary
 against an adversarial agent.
@@ -447,16 +492,21 @@ and Gemini (explicit context caching).
 
 The prompt file is read as UTF-8 (with or without a byte-order mark) or, when
 it starts with a byte-order mark, as UTF-16 or UTF-32 (PowerShell 5's `>`
-writes UTF-16); the prompt `-o` writes is plain UTF-8. A file in any other
-encoding, a file that cannot be read and an output path that cannot be
-written are each one `error:` line and exit `2`. (Before 0.1.2 the first and
-the last were a traceback and exit `1`.)
+writes UTF-16; the `--pricing` file is read the same way); the prompt `-o`
+writes is plain UTF-8. A file in any other encoding, a file that cannot be
+read and an output path that cannot be written are each one `error:` line and
+exit `2`. (Before 0.1.2 the first and the last were a traceback and exit `1`.)
 
 ## Testing
 
 ```bash
 python3 -m unittest discover -s tests -v   # or: python3 -m pytest -q
 ```
+
+The source distribution carries `tests/` and `sim/` as well, so the same
+command works in an unpacked archive. (Before 0.1.3 it lacked
+`tests/_isolate.py` and `sim/runaway.py`, so most of the test files failed
+to import.)
 
 `sim/runaway.py` is a fake agent emitting realistic stream-json — the suite
 kills it for real (budget, spawn, token, and timeout breaches) without
@@ -467,12 +517,20 @@ returns and kills the whole tree, sends the leash itself Ctrl-C and SIGTERM
 at a temp dir). The Windows shim resolution and the cmd.exe refusal list
 are unit-tested with a fake shim directory on every platform.
 
-## Scope / limits (v0.1.2)
+## Scope / limits (v0.1.3)
 
 - Claude Code `-p` (non-interactive) is the supported path. Interactive
   sessions and other agents (Codex, Cursor) are on the roadmap — the
   event parser is isolated in `events.py` for exactly this.
 - Cost mid-run is an estimate; treat `--budget` as a guardrail, not accounting.
+- **The model is read from the stream's `system`/`init` event only.** Every
+  live estimate is priced at that model's rate, even if a later `assistant`
+  event names another model (a subagent on a dearer one, say), so a cost cap
+  can trip later (or earlier) than the real spend warrants; the agent's own
+  `total_cost_usd` replaces the estimate when the run completes and is
+  compared with the caps then. Whether a real Claude Code stream ever names a
+  different model that way has not been verified here: the behaviour was
+  only seen on a stream made up for the test.
 - **Live enforcement needs per-message events.** An agent that reports only
   a final `result` can be checked after it has finished, not stopped (see
   *Live, or only afterwards*). Whether the real `claude` CLI's
@@ -493,6 +551,12 @@ are unit-tested with a fake shim directory on every platform.
   exit-code changes of 0.1.1, and the changes of 0.1.2 (UTF-16 prompt files
   for `cache`, `--output-format=`, `--min-history`, usage blocks the leash
   cannot read, the echo wording), were written to be platform-neutral and are
-  covered by tests that run on Windows too (the suite passes there on Python
-  3.11), but they were developed on Linux: no file written by a real
+  covered by tests that run on Windows too (the suite passed there on Python
+  3.11 for 0.1.2), but they were developed on Linux: no file written by a real
   PowerShell 5 was read.
+- **What 0.1.3 was run on:** Linux only, Python 3.10 to 3.14 (and pytest on
+  3.11). Not on Windows or macOS, and not against a real `claude`. Agent names
+  in other letter cases are tested by name (and with a script really called
+  `Claude` on POSIX), a Python without `sqlite3` is simulated, and the
+  byte-order-mark and UTF-16 files are built byte by byte, not written by a
+  real PowerShell.

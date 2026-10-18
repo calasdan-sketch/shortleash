@@ -17,7 +17,6 @@ import errno
 import atexit
 import math
 import os
-import sqlite3
 import sys
 
 from . import cacheopt
@@ -77,7 +76,10 @@ def _add_run_parser(sub) -> None:
                         "--prompt) with <redacted> in the receipt. Prompts "
                         "are stored verbatim otherwise.")
     r.add_argument("--quiet", action="store_true",
-                   help="Suppress the human-readable receipt on stderr.")
+                   help="Leave the startup banner, the human-readable "
+                        "receipt and the one-line notices off stderr. The "
+                        "agent's output, the --receipt JSON, errors and "
+                        "fleet warnings are not affected.")
     r.add_argument("--anomaly", type=float, default=None, nargs="?",
                    const=DEFAULT_ANOMALY, metavar="MULT",
                    help="Opt in to anomaly mode: trip when live cost/tokens "
@@ -88,9 +90,14 @@ def _add_run_parser(sub) -> None:
                    help="Accepted for compatibility: anomaly mode is already "
                         "off unless --anomaly is given.")
     r.add_argument("--profile", type=str, default="",
-                   help="Baseline grouping key (default: agent binary name).")
-    r.add_argument("--history-path", type=str, default=None,
-                   help="History file (default ~/.shortleash/history.jsonl).")
+                   help="Baseline grouping key (default: the agent binary's "
+                        "name in lower case, without .exe/.cmd/.bat/.com/"
+                        ".ps1).")
+    r.add_argument("--history-path", type=str, default=None, metavar="FILE",
+                   help="File that finished runs are recorded in and that "
+                        "--anomaly reads its baseline from (default: "
+                        "history.jsonl in ~/.shortleash, or in "
+                        "$SHORTLEASH_HOME).")
     r.add_argument("--min-history", type=int, default=5,
                    help="Past runs needed before anomaly mode arms (at least "
                         "1: the baseline is the median of them; default 5).")
@@ -103,7 +110,9 @@ def _add_run_parser(sub) -> None:
     r.add_argument("--fleet-owner", default="",
                    help="Owner label on the fleet claim.")
     r.add_argument("--fleet-ttl", type=int, default=fleet_mod.DEFAULT_TTL,
-                   help="Claim TTL seconds (default 1800, max 86400).")
+                   help=f"Claim TTL in seconds, 1 to {fleet_mod.MAX_TTL} "
+                        f"(default {fleet_mod.DEFAULT_TTL}); a value outside "
+                        "that range is refused.")
     r.add_argument("command", nargs=argparse.REMAINDER,
                    help="Command to run, after -- : shortleash run --budget 2 -- claude -p ...")
 
@@ -235,7 +244,11 @@ def _cmd_fleet(args) -> int:
             claims = fleet_mod.active_claims(conn)
         finally:
             conn.close()
-    except (sqlite3.Error, OSError) as e:
+    except fleet_mod.FleetUnavailable as e:
+        # not a broken database: this Python cannot do fleet claims at all
+        print(f"shortleash: error: {e}", file=sys.stderr)
+        return 2
+    except fleet_mod.db_errors() as e:
         print(f"shortleash: error: the fleet database is unusable "
               f"({_fleet_db()}): {e}", file=sys.stderr)
         return 1
@@ -358,6 +371,12 @@ def main(argv: list[str] | None = None) -> int:
         # from zero of them.
         if args.min_history < 1:
             parser.error(f"--min-history must be >= 1 (got {args.min_history})")
+        # A claim lives for its TTL and no longer than a day: the database
+        # used to cut a larger value down without a word. Say so instead,
+        # whether or not --fleet is given (every option is checked up front).
+        if not 1 <= args.fleet_ttl <= fleet_mod.MAX_TTL:
+            parser.error(f"--fleet-ttl must be between 1 and "
+                         f"{fleet_mod.MAX_TTL} seconds (got {args.fleet_ttl})")
         if args.no_anomaly:
             args.anomaly = None
         # argparse puts everything after `--` in `command`, possibly
@@ -426,7 +445,13 @@ def _run_with_fleet(g, cmd: list[str], args) -> int:
     except ValueError as e:
         print(f"shortleash: fleet claim error: {e}", file=sys.stderr)
         return 2
-    except (sqlite3.Error, OSError) as e:
+    except fleet_mod.FleetUnavailable as e:
+        # Also advisory: no sqlite3 in this Python is a warning, not a stop.
+        note = f"{e}; running WITHOUT a claim"
+        sys.stderr.write(f"[shortleash] fleet WARNING: {note}\n")
+        g.warnings.append(note)
+        return g.run(cmd)
+    except fleet_mod.db_errors() as e:
         # A claim is advisory (a conflict only warns): a database that
         # cannot be opened is a warning too, never a reason not to run.
         note = (f"fleet database unusable ({_fleet_db()}): {e}; running "
