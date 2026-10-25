@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5
+
+- Release workflow: the tag check read a version from `pyproject.toml` that does not exist here (the version is dynamic), so a correct tag failed. The check now compares the tag with the version in the built file names (`.github/scripts/release_check.py`), and refuses a tag whose commit is not on `main`.
+- CI builds the source archive and runs the tests from the unpacked archive.
+- Receipts no longer mangle ordinary words: `disk-usage-report` and `basic functionality` in a prompt are left alone, and `--author` is not treated as a secret (`auth` now matches only as a whole word: `--auth`, `--oauth`, `--authorization`).
+- Receipts redact more: `-uuser:pass`, `https://user:pass@host/x` (the `user:pass@` part) and `password:value`.
+- README: the 8 million character line skip, the echo queue counting pieces rather than lines, `claude-3-haiku` being priced as Haiku 4.5, and 1-hour cache writes not being modelled are now written down.
+
 ## 0.1.4
 
 - `run --fleet`: if stderr is closed early (`... 2>&1 | head -1`) the agent now still starts and the fleet claim is released, instead of leaking the claim and never running.

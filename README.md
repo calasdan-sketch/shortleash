@@ -84,6 +84,16 @@ reader and the machine; no amount is promised. If that reader is still stuck
 when the run ends, the leash gives up on it after two seconds without
 progress, so the summary and the exit code are not held hostage.
 
+Two limits you should know about. The unit that is queued, counted and
+dropped is a *piece* of up to 64 KB, not always a whole line: when a very
+long output line meets a full queue, the reader gets that line with a gap in
+it, and the warning's "line(s)" really counts pieces. And an output line
+longer than 8 million characters (8 MiB of text) is never parsed for
+telemetry at all: it is skipped, the receipt says so
+(`an agent output line longer than 8388608 characters was skipped`), and any
+usage inside it is not counted, so a cap cannot see it. Normal stream-json
+lines are far below that.
+
 Non-JSON lines on the agent's stdout (warnings, entrypoint chatter) are not
 telemetry and are ignored; a telemetry event whose fields are malformed
 (`"input_tokens": "abc"`) trips the run — the guard fails closed rather than
@@ -296,11 +306,18 @@ and such a run is not added to the history.
 
 `command` is the wrapped argv with **secret-looking values redacted**: the
 value after any flag whose name contains `key`, `token`, `secret`,
-`password`, `passwd`, `auth`, `bearer`, `credential` or `cookie`
-(`--api-key sk-…`, `--token=…`, `DB_PASSWORD=…`, `--cookie …`) becomes `***`;
-so does the value of `-u`/`--user`, the secret part of an HTTP header given
-with `-H`/`--header` (`Authorization: ***`), and any `sk-…` key, `Bearer …`
-credential or GitHub / Slack / AWS token wherever it appears in an argument.
+`password`, `passwd`, `bearer`, `credential` or `cookie`, or has `auth`
+(or `oauth`, `authorization`) as a whole word (`--api-key sk-…`,
+`--token=…`, `DB_PASSWORD=…`, `--cookie …`, `--auth x`) becomes `***`;
+`--author` is not touched. So does the value of `-u`/`--user` (also glued on,
+`-uuser:pass`), a `name:value` argument with such a name (`password:hunter2`),
+the `user:password@` part of a URL (`https://***@host/x`), the secret part of
+an HTTP header given with `-H`/`--header` (`Authorization: ***`), and any
+`sk-…` key (not inside a word, so `disk-usage-report` is safe), `Bearer …`
+credential, `Basic …` credential (only when it looks like base64: a word like
+`basic functionality` in a prompt is left alone) or GitHub / Slack / AWS token
+wherever it appears in an argument. This is pattern matching: a secret in an
+unusual shape is not recognised, so keep real secrets out of command lines.
 The receipt file is written with mode `0600` (owner only). **The prompt is not a secret by that rule and is stored
 verbatim** — `-p "my password is hunter2"` ends up in `receipt.json` as
 typed. Pass `--redact-prompt` to replace the argument after `-p`,
@@ -349,6 +366,19 @@ A model that matches **no** entry is priced with the `default` entry
 stderr as soon as the model is known (not under `--quiet`), the same text
 as a receipt `warning:`, and `"price_assumed": true` in the receipt JSON.
 Add the model to your pricing file to silence it.
+
+The estimate prices two things roughly, both on the cautious or the
+cheap side as noted. A model the table does not name more precisely than its
+family is priced at the family rate: `claude-3-haiku` ($0.25 / $1.25 per 1M
+tokens) matches `haiku` and is priced as Haiku 4.5 ($1 / $5), so its estimate
+runs about four times high (add `{"3-haiku": [0.25, 1.25]}` to your pricing
+file to fix that). Cache reads are priced at 0.10x and cache writes at 1.25x
+the input rate, the 5-minute rate; a cache write kept for **1 hour** costs
+2x, and the leash does not model it (the stream does not say which kind a
+write was in the fields the leash reads), so a run that writes a lot of
+1-hour cache can cost up to 60% more on those tokens than the live estimate
+says. The agent's own `total_cost_usd` replaces the estimate in the final
+receipt when it is there.
 
 ### No telemetry, no comfort
 
@@ -526,7 +556,7 @@ returns and kills the whole tree, sends the leash itself Ctrl-C and SIGTERM
 at a temp dir). The Windows shim resolution and the cmd.exe refusal list
 are unit-tested with a fake shim directory on every platform.
 
-## Scope / limits (v0.1.4)
+## Scope / limits (v0.1.5)
 
 - Claude Code `-p` (non-interactive) is the supported path. Interactive
   sessions and other agents (Codex, Cursor) are on the roadmap — the
@@ -563,8 +593,8 @@ are unit-tested with a fake shim directory on every platform.
   covered by tests that run on Windows too (the suite passed there on Python
   3.11 for 0.1.2), but they were developed on Linux: no file written by a real
   PowerShell 5 was read.
-- **What 0.1.4 was run on:** Linux only, Python 3.10 to 3.14 (and pytest on
-  3.11). Not on Windows or macOS, and not against a real `claude`. Agent names
+- **What 0.1.5 was run on:** Linux only, Python 3.10, 3.13 and 3.14 and the
+  unpacked source archive. Not on Windows or macOS, and not against a real `claude`. Agent names
   in other letter cases are tested by name (and with a script really called
   `Claude` on POSIX), a Python without `sqlite3` is simulated, and the
   byte-order-mark and UTF-16 files are built byte by byte, not written by a

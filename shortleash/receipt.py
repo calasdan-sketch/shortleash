@@ -14,8 +14,11 @@ from . import __version__
 # Any argument whose NAME matches one of these (case-insensitive) gets its
 # VALUE replaced with *** in receipts. Matches --api-key, api_key=, -token,
 # --db-password value, etc.
+# "auth" counts only as a whole word part (--auth, auth_header, x-auth-key,
+# oauth, authorization, authentication): "--author" is not a secret.
 _SECRET_NAME_RE = re.compile(
-    r"key|token|secret|password|passwd|auth|bearer|credential|cookie",
+    r"key|token|secret|password|passwd|bearer|credential|cookie"
+    r"|(?<![A-Za-z])o?auth(?:orization|entication)?(?![A-Za-z])",
     re.IGNORECASE)
 #: Flags whose value is credentials although the name does not say so
 #: (curl -u user:pass, --proxy-user).
@@ -25,10 +28,17 @@ _HEADER_FLAGS = {"-H", "--header", "--proxy-header"}
 #: Secret-looking tokens inside ANY argument, wherever they appear:
 #: sk-... API keys, Bearer/Basic credentials, GitHub / Slack / AWS tokens.
 _SECRET_VALUE_RE = re.compile(
-    r"sk-[A-Za-z0-9_\-]{8,}"
-    r"|(?i:(?:bearer|basic)\s+)[A-Za-z0-9._~+/=\-]{8,}"
+    r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_\-]{8,}"
+    r"|(?<![A-Za-z0-9])(?i:bearer)\s+[A-Za-z0-9._~+/=\-]{8,}"
+    r"|(?<![A-Za-z0-9])(?i:basic)\s+(?=[A-Za-z0-9+/]*[A-Z0-9+/=])"
+    r"[A-Za-z0-9._~+/=\-]{8,}"
     r"|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
     r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}")
+#: user:password@ inside a URL (https://user:pass@host/x).
+_URL_USERINFO_RE = re.compile(r"(?<=://)[^/\s:@]*:[^/\s@]*@")
+#: A short flag with its value glued on: curl -uuser:pass.
+_GLUED_USER_RE = re.compile(r"^(-[uU])(?!-)(.+:.*)$")
+_COLON_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_-]*):(?!//)(.+)$", re.DOTALL)
 _FLAG_EQ_RE = re.compile(r"^(--?)([A-Za-z0-9_][A-Za-z0-9_-]*)=(.*)$")
 _BARE_EQ_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_-]*)=(.*)$")
 _FLAG_RE = re.compile(r"^(--?)([A-Za-z0-9_][A-Za-z0-9_-]*)$")
@@ -53,7 +63,7 @@ def _redact_header(text: str) -> str:
 
 
 def _scrub(arg: str) -> str:
-    return _SECRET_VALUE_RE.sub("***", arg)
+    return _URL_USERINFO_RE.sub("***@", _SECRET_VALUE_RE.sub("***", arg))
 
 
 def redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
@@ -111,6 +121,10 @@ def _redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
             if eq_flag:
                 out.append(f"{eq_flag}={REDACTED_PROMPT}")
                 continue
+        m = _GLUED_USER_RE.match(a)
+        if m:
+            out.append(m.group(1) + "***")
+            continue
         m = _FLAG_EQ_RE.match(a)
         if m:
             prefix, name, value = m.groups()
@@ -126,6 +140,10 @@ def _redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
             name, value = m.groups()
             out.append(f"{name}="
                        + ("***" if _is_secret_name(name) else value))
+            continue
+        m = _COLON_RE.match(a)
+        if m and _is_secret_name(m.group(1)):
+            out.append(f"{m.group(1)}:***")
             continue
         m = _FLAG_RE.match(a)
         if m and _is_secret_name(m.group(2)):
