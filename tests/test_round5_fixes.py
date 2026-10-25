@@ -613,7 +613,7 @@ class TestPricingLookup(unittest.TestCase):
 
     def test_which_entry_priced_a_model(self):
         t = pricing.load_table(None, environ={})
-        self.assertEqual(pricing.match("claude-opus-4-1", t)[0], "opus")
+        self.assertEqual(pricing.match("claude-opus-4-1", t)[0], "opus-4-1")
         self.assertEqual(pricing.match("mystery-model-9", t)[0], "default")
         self.assertEqual(pricing.match("", t)[0], "default")
 

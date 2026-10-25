@@ -26,7 +26,33 @@ class TestPricing(unittest.TestCase):
         self.assertAlmostEqual(
             pricing.estimate_cost("claude-opus-4-1", usage), 15.00)
         self.assertAlmostEqual(
-            pricing.estimate_cost("claude-haiku-4", usage), 0.80)
+            pricing.estimate_cost("claude-haiku-3-5", usage), 0.80)
+        self.assertAlmostEqual(
+            pricing.estimate_cost("claude-haiku-4-5", usage), 1.00)
+
+    def test_current_models_use_current_published_rates(self):
+        one = {"input": 1_000_000, "output": 0, "cache_write": 0,
+               "cache_read": 0}
+        for model, want in (("claude-opus-4-5", 5.0),
+                            ("claude-opus-4-5-20251101", 5.0),
+                            ("claude-opus-4-8", 5.0), ("claude-opus-5", 5.0),
+                            ("claude-opus-5-5", 4.0),
+                            ("claude-opus-4-1-20250805", 15.0),
+                            ("claude-opus-4-20250514", 15.0),
+                            ("claude-3-opus-20240229", 15.0),
+                            ("claude-sonnet-4-5", 3.0),
+                            ("claude-sonnet-5", 2.0),
+                            ("claude-3-5-haiku-20241022", 0.80),
+                            ("claude-haiku-4-5-20251001", 1.0)):
+            self.assertAlmostEqual(pricing.estimate_cost(model, one), want,
+                                   msg=model)
+        out = {"input": 0, "output": 1_000_000, "cache_write": 0,
+               "cache_read": 0}
+        self.assertAlmostEqual(
+            pricing.estimate_cost("claude-opus-4-5", out), 25.0)
+        self.assertAlmostEqual(
+            pricing.estimate_cost("claude-haiku-4-5", out), 5.0)
+        self.assertEqual(pricing.match("claude-opus-4-5", None)[0], "opus-4-5")
 
     def test_unknown_model_falls_back_to_default(self):
         usage = {"input": 1_000_000, "output": 0,

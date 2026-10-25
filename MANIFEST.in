@@ -4,4 +4,5 @@
 graft tests
 graft sim
 # `graft` takes whatever lies in the directory, test-run caches included.
+include CHANGELOG.md
 global-exclude *.py[cod]

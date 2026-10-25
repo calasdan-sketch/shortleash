@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import stat
 from datetime import datetime, timezone
 
 from . import __version__
@@ -13,8 +14,21 @@ from . import __version__
 # Any argument whose NAME matches one of these (case-insensitive) gets its
 # VALUE replaced with *** in receipts. Matches --api-key, api_key=, -token,
 # --db-password value, etc.
-_SECRET_NAME_RE = re.compile(r"key|token|secret|password|passwd",
-                             re.IGNORECASE)
+_SECRET_NAME_RE = re.compile(
+    r"key|token|secret|password|passwd|auth|bearer|credential|cookie",
+    re.IGNORECASE)
+#: Flags whose value is credentials although the name does not say so
+#: (curl -u user:pass, --proxy-user).
+_SECRET_VALUE_FLAGS = {"-u", "--user", "--proxy-user", "-U"}
+#: Flags whose value is an HTTP header line ("Authorization: Bearer ...").
+_HEADER_FLAGS = {"-H", "--header", "--proxy-header"}
+#: Secret-looking tokens inside ANY argument, wherever they appear:
+#: sk-... API keys, Bearer/Basic credentials, GitHub / Slack / AWS tokens.
+_SECRET_VALUE_RE = re.compile(
+    r"sk-[A-Za-z0-9_\-]{8,}"
+    r"|(?i:(?:bearer|basic)\s+)[A-Za-z0-9._~+/=\-]{8,}"
+    r"|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}")
 _FLAG_EQ_RE = re.compile(r"^(--?)([A-Za-z0-9_][A-Za-z0-9_-]*)=(.*)$")
 _BARE_EQ_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_-]*)=(.*)$")
 _FLAG_RE = re.compile(r"^(--?)([A-Za-z0-9_][A-Za-z0-9_-]*)$")
@@ -29,7 +43,24 @@ def _is_secret_name(name: str) -> bool:
     return _SECRET_NAME_RE.search(name) is not None
 
 
+def _redact_header(text: str) -> str:
+    """`Authorization: Bearer x` -> `Authorization: ***` (name kept)."""
+    name, sep, _rest = text.partition(":")
+    if sep and (_is_secret_name(name) or name.strip().lower()
+                in ("proxy-authorization", "x-api-key")):
+        return f"{name}: ***"
+    return text
+
+
+def _scrub(arg: str) -> str:
+    return _SECRET_VALUE_RE.sub("***", arg)
+
+
 def redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
+    return [_scrub(a) for a in _redact_argv(argv, redact_prompt)]
+
+
+def _redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
     """Return argv with secret values replaced by ***.
 
     Never mutate the original. Handles three shapes:
@@ -46,11 +77,24 @@ def redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
     """
     out: list[str] = []
     redact_next = False
+    header_next = False
     prompt_next = False
     for a in argv:
         if redact_next:
             out.append("***")
             redact_next = False
+            continue
+        if header_next:
+            out.append(_redact_header(a))
+            header_next = False
+            continue
+        if a in _HEADER_FLAGS:
+            out.append(a)
+            header_next = True
+            continue
+        if a in _SECRET_VALUE_FLAGS:
+            out.append(a)
+            redact_next = True
             continue
         if prompt_next:
             prompt_next = False
@@ -70,6 +114,10 @@ def redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
         m = _FLAG_EQ_RE.match(a)
         if m:
             prefix, name, value = m.groups()
+            if prefix + name in _HEADER_FLAGS:
+                value = _redact_header(value)
+            elif prefix + name in _SECRET_VALUE_FLAGS:
+                value = "***"
             out.append(f"{prefix}{name}="
                        + ("***" if _is_secret_name(name) else value))
             continue
@@ -304,5 +352,12 @@ def prepare_receipt_path(path: str) -> None:
 
 
 def write_receipt(receipt: dict, path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+    # The command line (even redacted) and the session are private: 0600.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            os.chmod(path, 0o600)   # a file that already existed too
+    except OSError:
+        pass
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(_sanitize(receipt), f, indent=2, allow_nan=False)

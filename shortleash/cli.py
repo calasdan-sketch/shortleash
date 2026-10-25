@@ -416,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
             # Never echo the full argv: it may contain secrets. Show only
             # the agent binary name alongside the caps.
             agent_bin = guard_mod.agent_name(cmd[0])
-            sys.stderr.write(
+            _stderr_write(
                 f"[shortleash] guarding: {agent_bin}\n"
                 f"[shortleash] {_caps_banner(args)}\n"
                 f"[shortleash] pricing: {pricing_table.describe()}\n"
@@ -425,6 +425,15 @@ def main(argv: list[str] | None = None) -> int:
             return _run_with_fleet(g, cmd, args)
         return g.run(cmd)
     return 0
+
+
+def _stderr_write(text: str) -> None:
+    """Advisory output: a closed or broken stderr never stops the run."""
+    try:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+    except (OSError, ValueError, AttributeError):
+        pass
 
 
 def _run_with_fleet(g, cmd: list[str], args) -> int:
@@ -448,7 +457,7 @@ def _run_with_fleet(g, cmd: list[str], args) -> int:
     except fleet_mod.FleetUnavailable as e:
         # Also advisory: no sqlite3 in this Python is a warning, not a stop.
         note = f"{e}; running WITHOUT a claim"
-        sys.stderr.write(f"[shortleash] fleet WARNING: {note}\n")
+        _stderr_write(f"[shortleash] fleet WARNING: {note}\n")
         g.warnings.append(note)
         return g.run(cmd)
     except fleet_mod.db_errors() as e:
@@ -456,7 +465,7 @@ def _run_with_fleet(g, cmd: list[str], args) -> int:
         # cannot be opened is a warning too, never a reason not to run.
         note = (f"fleet database unusable ({_fleet_db()}): {e}; running "
                 f"WITHOUT a claim")
-        sys.stderr.write(f"[shortleash] fleet WARNING: {note}\n")
+        _stderr_write(f"[shortleash] fleet WARNING: {note}\n")
         g.warnings.append(note)
         return g.run(cmd)
     claim_id = res.get("claim_id")
@@ -470,23 +479,25 @@ def _run_with_fleet(g, cmd: list[str], args) -> int:
             except Exception:
                 pass
 
-    if res["ok"]:
-        if not args.quiet:
-            sys.stderr.write(
-                f"[shortleash] fleet claim {claim_id}: "
-                f"{', '.join(res['paths'])}\n")
-    else:
-        sys.stderr.write("[shortleash] fleet WARNING: paths already "
-                         "claimed — proceeding anyway:\n")
-        for c in res["conflicts"]:
-            h = c["holder"]
-            sys.stderr.write(
-                f"  {c['path']} held by {h['owner'] or '?'} "
-                f"({h['ttl_left']}s left)"
-                + (f": {h['note']}" if h["note"] else "") + "\n")
-
+    # Release is registered and the try is entered BEFORE anything else can
+    # fail: a stderr that closed early (`2>&1 | head -1`) used to raise out
+    # of the writes below, leaking the claim and never starting the agent.
     atexit.register(_release)
     try:
+        if res["ok"]:
+            if not args.quiet:
+                _stderr_write(
+                    f"[shortleash] fleet claim {claim_id}: "
+                    f"{', '.join(res['paths'])}\n")
+        else:
+            _stderr_write("[shortleash] fleet WARNING: paths already "
+                          "claimed \u2014 proceeding anyway:\n")
+            for c in res["conflicts"]:
+                h = c["holder"]
+                _stderr_write(
+                    f"  {c['path']} held by {h['owner'] or '?'} "
+                    f"({h['ttl_left']}s left)"
+                    + (f": {h['note']}" if h["note"] else "") + "\n")
         return g.run(cmd)
     finally:
         _release()

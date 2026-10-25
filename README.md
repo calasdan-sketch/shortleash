@@ -14,8 +14,11 @@ Vendors' "budgets" only warn while the meter keeps running. This one halts.
 Zero dependencies — Python 3.10+ stdlib only.
 
 ```bash
-pip install git+https://github.com/calasdan-sketch/shortleash
+pip install shortleash
 shortleash run --budget 2.00 -- <command>
+
+# or from source
+pip install git+https://github.com/calasdan-sketch/shortleash
 
 # or, from a checkout, without installing:
 python3 -m shortleash run --budget 2.00 -- <command>
@@ -264,7 +267,7 @@ Every run ends with a receipt on stderr and optionally as JSON
   tokens:    51,000 (in=15,000 out=4,500 cache_r=30,000 cache_w=1,500)
   turns:     0   spawns: 1
   duration:  0.16s   exit: 124
-  pricing:   built-in fallback table as of 2026-10-16 — verify against provider pricing
+  pricing:   built-in fallback table as of 2026-10-24 — verify against provider pricing
   STOPPED:   budget exceeded: estimated $0.1271 > $0.05 cap
 ──────────────────────────────────────────────────
 ```
@@ -293,8 +296,12 @@ and such a run is not added to the history.
 
 `command` is the wrapped argv with **secret-looking values redacted**: the
 value after any flag whose name contains `key`, `token`, `secret`,
-`password` or `passwd` (`--api-key sk-…`, `--token=…`, `DB_PASSWORD=…`)
-becomes `***`. **The prompt is not a secret by that rule and is stored
+`password`, `passwd`, `auth`, `bearer`, `credential` or `cookie`
+(`--api-key sk-…`, `--token=…`, `DB_PASSWORD=…`, `--cookie …`) becomes `***`;
+so does the value of `-u`/`--user`, the secret part of an HTTP header given
+with `-H`/`--header` (`Authorization: ***`), and any `sk-…` key, `Bearer …`
+credential or GitHub / Slack / AWS token wherever it appears in an argument.
+The receipt file is written with mode `0600` (owner only). **The prompt is not a secret by that rule and is stored
 verbatim** — `-p "my password is hunter2"` ends up in `receipt.json` as
 typed. Pass `--redact-prompt` to replace the argument after `-p`,
 `--print` or `--prompt` (and a `--prompt=…` value) with `<redacted>`; a
@@ -305,17 +312,18 @@ recognised. The history file never stores command text.
 
 The built-in table (`pricing.py`, USD per 1M tokens) is **not fetched from
 anywhere**; it was written on the date in `PRICING_AS_OF`. The startup banner
-says so (`pricing: built-in fallback table as of 2026-10-16 — verify against
+says so (`pricing: built-in fallback table as of 2026-10-24 — verify against
 provider pricing`; not under `--quiet`), the receipt on stderr repeats that
 line whenever the cost it shows is an estimate, and the JSON receipt always
 carries it (`pricing`: `as_of`, `source`). Check it against the provider's
-pricing page before trusting a `--budget` to the cent, and override it with
+pricing page (the built-in numbers were read from
+<https://platform.claude.com/docs/en/about-claude/pricing>) before trusting a `--budget` to the cent, and override it with
 `--pricing pricing.json` or the `SHORTLEASH_PRICING` environment variable
 pointing at a JSON file:
 
 ```json
-{"as_of": "2026-10-16",
- "sonnet": [3.0, 15.0], "opus": [15.0, 75.0], "haiku": [0.8, 4.0]}
+{"as_of": "2026-10-24",
+ "sonnet": [3.0, 15.0], "opus": [5.0, 25.0], "haiku": [1.0, 5.0]}
 ```
 
 `as_of` is optional metadata echoed in the receipt; every other key is a
@@ -501,6 +509,7 @@ exit `2`. (Before 0.1.2 the first and the last were a traceback and exit `1`.)
 
 ```bash
 python3 -m unittest discover -s tests -v   # or: python3 -m pytest -q
+# `-s tests -t .` works too
 ```
 
 The source distribution carries `tests/` and `sim/` as well, so the same
@@ -517,7 +526,7 @@ returns and kills the whole tree, sends the leash itself Ctrl-C and SIGTERM
 at a temp dir). The Windows shim resolution and the cmd.exe refusal list
 are unit-tested with a fake shim directory on every platform.
 
-## Scope / limits (v0.1.3)
+## Scope / limits (v0.1.4)
 
 - Claude Code `-p` (non-interactive) is the supported path. Interactive
   sessions and other agents (Codex, Cursor) are on the roadmap — the
@@ -554,7 +563,7 @@ are unit-tested with a fake shim directory on every platform.
   covered by tests that run on Windows too (the suite passed there on Python
   3.11 for 0.1.2), but they were developed on Linux: no file written by a real
   PowerShell 5 was read.
-- **What 0.1.3 was run on:** Linux only, Python 3.10 to 3.14 (and pytest on
+- **What 0.1.4 was run on:** Linux only, Python 3.10 to 3.14 (and pytest on
   3.11). Not on Windows or macOS, and not against a real `claude`. Agent names
   in other letter cases are tested by name (and with a script really called
   `Claude` on POSIX), a Python without `sqlite3` is simulated, and the

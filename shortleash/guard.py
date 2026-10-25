@@ -120,6 +120,13 @@ ECHO_QUEUE_LIMIT = 4 * 1024 * 1024
 ECHO_STALL_SECONDS = 2.0
 
 
+#: Longest agent output line (in characters) that is parsed for telemetry.
+#: A longer line is skipped, not buffered: a runaway child printing one
+#: 600 MB line would otherwise cost >1 GB of memory.
+MAX_LINE_CHARS = 8 * 1024 * 1024
+_READ_CHUNK = 64 * 1024
+
+
 class _EchoPump:
     """Passes the agent's output lines to ``write`` on a thread of its own.
 
@@ -573,33 +580,67 @@ class Guard:
 
     def _monitor_stdout(self) -> None:
         assert self.proc is not None and self.proc.stdout is not None
-        for line in self.proc.stdout:
-            # Hand the line to the echo thread first (it never waits), then
+        stream = self.proc.stdout
+        parts: list[str] = []
+        size = 0
+        overflow = False
+        while True:
+            # Bounded reads: a child that prints one endless line (hundreds
+            # of MB with no newline) must not become one endless string here.
+            piece = stream.readline(_READ_CHUNK)
+            if not piece:
+                line = None if overflow or not parts else "".join(parts)
+                if line is not None and self._process_line(line, echo=False):
+                    return
+                return
+            # Hand the piece to the echo thread first (it never waits), then
             # parse: nothing about our stdout may delay a cap check.
             pump = self._pump
             if pump is not None and self.echo:
-                pump.put(line)
-            try:
-                # Trust boundary: the child is untrusted. Lines that are not
-                # JSON objects (warnings, entrypoint chatter, plain text) are
-                # NOT telemetry and are ignored — events.parse_line returns
-                # None for them. A line that IS a telemetry event but whose
-                # fields are malformed (a numeric field that isn't numeric,
-                # e.g. "input_tokens": "abc" raising ValueError) fails
-                # closed: the run is tripped immediately. Letting the
-                # exception escape would kill this thread and leave the
-                # supervisor blocked on proc.wait() forever.
-                obs = events.parse_line(line)
-                if obs is not None:
-                    obs = self._handle_obs(obs)
-            except Exception as e:
-                self._trip(
-                    f"malformed telemetry: unparseable stream-json line "
-                    f"({type(e).__name__}: {e}); failing closed"
-                )
-                break
-            if self.breached:
-                break
+                pump.put(piece)
+            if not overflow:
+                parts.append(piece)
+                size += len(piece)
+                if size > MAX_LINE_CHARS:
+                    overflow = True
+                    parts = []
+                    self._note_long_line()
+            if not piece.endswith("\n"):
+                continue
+            line = None if overflow else "".join(parts)
+            parts, size, overflow = [], 0, False
+            if line is not None and self._process_line(line, echo=False):
+                return
+
+    def _note_long_line(self) -> None:
+        note = (f"an agent output line longer than {MAX_LINE_CHARS} "
+                f"characters was skipped (not parsed for telemetry)")
+        with self._lock:
+            if note not in self.warnings:
+                self.warnings.append(note)
+
+    def _process_line(self, line: str, echo: bool = False) -> bool:
+        """Parse one complete line; True when the run has breached."""
+        try:
+            # Trust boundary: the child is untrusted. Lines that are not
+            # JSON objects (warnings, entrypoint chatter, plain text) are
+            # NOT telemetry and are ignored - events.parse_line returns
+            # None for them. A line that IS a telemetry event but whose
+            # fields are malformed (a numeric field that isn't numeric,
+            # e.g. "input_tokens": "abc" raising ValueError) fails
+            # closed: the run is tripped immediately. Letting the
+            # exception escape would kill this thread and leave the
+            # supervisor blocked on proc.wait() forever.
+            obs = events.parse_line(line)
+            if obs is not None:
+                obs = self._handle_obs(obs)
+        except Exception as e:
+            self._trip(
+                f"malformed telemetry: unparseable stream-json line "
+                f"({type(e).__name__}: {e}); failing closed"
+            )
+            return True
+        return bool(self.breached)
 
     def _handle_obs(self, obs: dict) -> dict:
         """Process one parsed observation. Returns the obs; trips on breach."""
