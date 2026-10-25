@@ -200,6 +200,9 @@ def build_receipt(
     enforced_live: dict | None = None,
     breach_live: bool | None = None,
     price_assumed: bool = False,
+    culprit: dict | None = None,
+    agents: dict | None = None,
+    forecast: list | None = None,
 ) -> dict:
     warnings = list(warnings or [])
     if cost_usd is not None and not math.isfinite(cost_usd):
@@ -269,6 +272,16 @@ def build_receipt(
         # One line of advice printed under STOPPED (e.g. how to leave the
         # anomaly ratchet), or None.
         "hint": hint,
+        # Who used the tokens when subagents were started:
+        # {"text", "agent", "spawns", "agent_spawns", "token_share"}, else
+        # None. From the tokens each message reports and the agent type each
+        # spawn named; it is the agent's own report, not an audit.
+        "culprit": culprit,
+        # {agent: {"spawns", "tokens"}} for the busiest agents ("main" is
+        # the main conversation).
+        "agents": dict(agents or {}),
+        # The early-warning lines given during the run (see forecast.py).
+        "forecast": list(forecast or []),
     }
 
 
@@ -322,6 +335,9 @@ def format_human(receipt: dict) -> str:
         # run was over: nothing was stopped, and saying so would be a lie.
         verb = "EXCEEDED:" if receipt.get("breach_live") is False else "STOPPED: "
         lines.append(f"  {verb}  {receipt['breach_reason']}")
+        culprit = receipt.get("culprit")
+        if culprit and culprit.get("text"):
+            lines.append(f"  culprit:   {culprit['text']}")
         if receipt.get("hint"):
             lines.append(f"  hint:      {receipt['hint']}")
     elif receipt.get("agent_error"):

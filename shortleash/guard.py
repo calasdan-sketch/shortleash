@@ -65,6 +65,7 @@ import threading
 import time
 
 from . import events
+from . import forecast as forecast_mod
 from . import history as history_mod
 from . import launch
 from . import pricing
@@ -101,6 +102,10 @@ ANOMALY_HINT = ("stopped by anomaly mode, so this run is NOT in the baseline "
                 "it finish and be recorded, or use --profile NAME for a "
                 "separate baseline")
 
+SPAWN_HINT = ("stopped by the spawn cap. The leash stops the run as soon as "
+              "it reads the launch that went over the limit, but subagents "
+              "that had already started may have used tokens by then. Raise "
+              "--max-spawns, or give the agent a narrower task")
 ANOMALY_HINT_AFTER = ("flagged by anomaly mode only after the run ended, so "
                       "this run is NOT in the baseline: re-run without "
                       "--anomaly to let it be recorded, or use --profile "
@@ -110,6 +115,10 @@ _EXE_SUFFIXES = (".exe", ".cmd", ".bat", ".com", ".ps1")
 #: How many message ids to remember for usage de-duplication. The split
 #: events of one message are consecutive, so a small window is plenty.
 _MESSAGE_WINDOW = 256
+#: How many spawn ids to remember to attribute subagent tokens, and how
+#: many distinct agent-type names to count (the rest are "(other)").
+_SPAWN_WINDOW = 4096
+_MAX_AGENT_KINDS = 50
 
 
 #: Most output (characters) that may wait to be echoed while our own stdout
@@ -274,6 +283,7 @@ class Guard:
         history_path: str | None = None,
         min_history: int = history_mod.MIN_HISTORY,
         redact_prompt: bool = False,
+        forecast: bool = True,
     ):
         self.budget = budget
         self.max_spawns = max_spawns
@@ -290,6 +300,7 @@ class Guard:
         self.history_path = history_path
         self.min_history = min_history
         self.redact_prompt = redact_prompt
+        self.forecast_enabled = forecast
         self._baseline: dict | None = None
         self._anomaly_armed: dict | None = None  # receipt "anomaly" field
         self.agent = ""
@@ -301,6 +312,15 @@ class Guard:
             collections.OrderedDict()
         self._seen_spawns: set[str] = set()
         self.spawns = 0
+        # Who spent what: spawn tool-use id -> agent type, then tokens and
+        # spawns per agent type ("main" = the main conversation). Bounded:
+        # the names come from the agent's own output.
+        self._spawn_agent: collections.OrderedDict[str, str] = \
+            collections.OrderedDict()
+        self.agent_tokens: collections.Counter = collections.Counter()
+        self.agent_spawns: collections.Counter = collections.Counter()
+        self._forecast_given: dict[str, set] = {"budget": set(), "tokens": set()}
+        self.forecast_events: list[dict] = []
         self.num_turns = 0
         self.model = ""
         self._price_notice_shown = False
@@ -339,6 +359,8 @@ class Guard:
         with self._lock:
             u = {k: max(0, obs["usage"].get(k, 0)) for k in self.usage}
             mid = obs.get("message_id") or ""
+            before = sum(self.usage.values())
+            types = obs.get("spawn_types") or {}
             if mid and mid in self._seen_messages:
                 # Same API response, next content block: usage repeats.
                 # Count only growth (output tokens can still rise), never
@@ -364,10 +386,100 @@ class Guard:
                     if key not in self._seen_spawns:
                         self._seen_spawns.add(key)
                         self.spawns += 1
+                        kind = self._agent_key(types.get(sid))
+                        self.agent_spawns[kind] += 1
+                        self._spawn_agent[sid] = kind
+                        while len(self._spawn_agent) > _SPAWN_WINDOW:
+                            self._spawn_agent.popitem(last=False)
+            grown = sum(self.usage.values()) - before
+            if grown > 0:
+                parent = obs.get("parent_tool_use_id")
+                who = ("main" if not parent
+                       else self._spawn_agent.get(parent, "subagent"))
+                self.agent_tokens[self._agent_key(who)] += grown
             if not obs.get("usage_unreadable"):
                 # (an event whose usage block the leash cannot read is not
                 # usage telemetry: it must not make a token cap look live)
                 self.usage_events += 1
+
+    def _agent_key(self, name) -> str:
+        """The name an agent type is counted under (caller holds the lock):
+        at most _MAX_AGENT_KINDS distinct names, the rest are "(other)"."""
+        name = name or events.UNKNOWN_AGENT
+        known = self.agent_tokens.keys() | self.agent_spawns.keys()
+        if name in known or len(known) < _MAX_AGENT_KINDS:
+            return name
+        return "(other)"
+
+    def culprit(self) -> dict | None:
+        """Who used the tokens, in one finding: {"text", "agent", "spawns",
+        "agent_spawns", "token_share"}, or None when no subagent was
+        started or nothing was counted. Says "the main conversation" when
+        that, not a subagent, used most of them."""
+        with self._lock:
+            total = sum(self.usage.values())
+            spawns = self.spawns
+            tokens = dict(self.agent_tokens)
+            made = dict(self.agent_spawns)
+        if not spawns or total <= 0:
+            return None
+        subs = {k: v for k, v in tokens.items() if k != "main"}
+        main = tokens.get("main", 0)
+        name, used = max(subs.items(), key=lambda kv: (kv[1], kv[0]),
+                         default=(None, 0))
+        if name is None or used < main:
+            share = main / total
+            text = (f"{spawns} spawns; most tokens ({share:.0%}) were used "
+                    f"in the main conversation")
+            return {"text": text, "agent": "main", "spawns": spawns,
+                    "agent_spawns": 0, "token_share": round(share, 4)}
+        share = used / total
+        return {"text": (f"{spawns} spawns, {share:.0%} of tokens in agent "
+                         f"{name}"),
+                "agent": name, "spawns": spawns,
+                "agent_spawns": made.get(name, 0),
+                "token_share": round(share, 4)}
+
+    def agent_breakdown(self) -> dict:
+        """{agent: {"spawns", "tokens"}} for the busiest agents (bounded)."""
+        with self._lock:
+            names = set(self.agent_tokens) | set(self.agent_spawns)
+            rows = {n: {"spawns": self.agent_spawns.get(n, 0),
+                        "tokens": self.agent_tokens.get(n, 0)} for n in names}
+        top = sorted(rows, key=lambda n: (-rows[n]["tokens"], n))[:10]
+        return {n: rows[n] for n in top}
+
+    def _check_forecast(self) -> None:
+        """Give the early-warning line when a cost or token cap is getting
+        close at the pace so far (see forecast.py). Never stops anything."""
+        if not self.forecast_enabled or not self.started_at:
+            return
+        elapsed = time.monotonic() - self.started_at
+        time_left = (None if self.timeout is None
+                     else max(self.timeout - elapsed, 0.0))
+        for kind, cap, spent in (
+                ("budget", self.budget,
+                 self.estimated_cost() if self.budget is not None else 0.0),
+                ("tokens", self.max_tokens,
+                 self.total_tokens() if self.max_tokens is not None else 0)):
+            if cap is None:
+                continue
+            guess = forecast_mod.project(spent, cap, elapsed)
+            if guess is None:
+                continue
+            level = forecast_mod.crossed(guess["share"],
+                                         self._forecast_given[kind])
+            if level is None or not forecast_mod.should_warn(
+                    guess["eta_s"], time_left):
+                continue
+            text = forecast_mod.line(kind, spent, cap, elapsed, guess["eta_s"])
+            with self._lock:
+                self.forecast_events.append({
+                    "kind": kind, "at_share": level, "spent": spent,
+                    "cap": cap, "elapsed_s": round(elapsed, 1),
+                    "eta_s": round(guess["eta_s"], 1)})
+            if not self.quiet:
+                _say(f"[shortleash] {text}\n")
 
     def estimated_cost(self) -> float:
         with self._lock:
@@ -657,6 +769,8 @@ class Guard:
             reason = self._check_caps()
             if reason:
                 self._trip(reason)
+            else:
+                self._check_forecast()
         elif kind == "result":
             cost = None
             if obs.get("cost_usd") is not None:
@@ -1164,6 +1278,8 @@ class Guard:
                 exit_code = BREACH_EXIT_CODE
             if (self.breach_reason or "").startswith("anomaly"):
                 hint = ANOMALY_HINT if self.breach_live else ANOMALY_HINT_AFTER
+            elif (self.breach_reason or "").startswith("spawn cap"):
+                hint = SPAWN_HINT
         elif self.agent_error and exit_code == 0:
             # The agent said the run failed even though it exited 0.
             exit_code = AGENT_ERROR_EXIT_CODE
@@ -1208,6 +1324,9 @@ class Guard:
             hint=hint,
             child_returncode=child_returncode,
             anomaly_armed=self._anomaly_armed,
+            culprit=self.culprit(),
+            agents=self.agent_breakdown(),
+            forecast=list(self.forecast_events),
         )
         show = not self.quiet
         # Learn from every run that produced telemetry (breached runs are

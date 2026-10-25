@@ -1,6 +1,6 @@
 # ShortLeash — stop runaway agents
 
-A circuit breaker for AI coding-agent runs. Wraps an agent command, tails its
+A circuit breaker for AI coding-agent runs — and a spawn-storm guard. Wraps an agent command, tails its
 telemetry in real time, and **kills the run the moment it breaches a guardrail**
 — budget, subagent-spawn cap, token cap, or wall-clock timeout. Emits a
 per-run receipt showing what it cost and why it stopped. "The moment" needs
@@ -28,6 +28,120 @@ Works on Linux, macOS and Windows 11 (Python 3.10+). On Windows, `claude`
 is found through `PATHEXT` (the npm `claude.cmd` shim — see *Windows*
 below), and console output never dies on a cp1252 code page — unencodable
 characters are replaced.
+
+## Spawn-storm guard (`--max-spawns`)
+
+The failure that burns real money fast is an agent that launches subagents
+that launch more subagents. `--max-spawns N` counts every subagent launch in
+the stream and stops the run when the count goes past N:
+
+```
+$ shortleash run --max-spawns 3 -- claude -p "audit every package"
+  STOPPED:   spawn cap exceeded: 4 subagents > 3 max
+  culprit:   4 spawns, 87% of tokens in agent Explore
+  hint:      stopped by the spawn cap. The leash stops the run as soon as it
+             reads the launch that went over the limit, but subagents that had
+             already started may have used tokens by then. ...
+```
+
+(That output is from a made-up agent that prints a stream of launches, run
+with `python3 storm.py 8` in the 0.2.0 tests; it was not a real `claude` run.)
+
+It **stops quickly, not instantly**: the leash reads the launch, then kills the
+process tree; subagents already running may spend tokens in between, and an
+agent that reports only at the end cannot be stopped live at all (see *Live,
+or only afterwards*). Treat it as a brake, not a guarantee.
+
+**The culprit line.** When a cap trips, the receipt (and the JSON receipt's
+`culprit` and `agents` fields) say which kind of agent used the tokens that
+grew since the last event, for example `38 spawns, 71% of tokens in agent
+Explore`, or `most tokens (62%) were used in the main conversation` when the
+subagents were not the problem. Tokens are attributed by the event that
+reported them (`parent_tool_use_id`); an event that names no agent counts as
+the main conversation.
+
+**Early warning (forecast).** With a `--budget` or `--max-tokens` cap, a line
+like `forecast: $0.55 of the $2.00 budget used after 1m 10s (27%); at this
+pace the budget is used up in about 3m 5s` is printed the first time the run
+passes 20%, then 50% and 80%. It is the pace so far carried forward, nothing
+smarter, so a bursty run will not match it. It stays quiet during the first
+five seconds and when the cap is more than an hour away. It never stops
+anything. `--no-forecast` turns it off.
+
+## Per-repo limits (`.shortleash.toml`)
+
+Put the limits next to the code so everyone who runs the agent in that repo
+gets them:
+
+```toml
+# .shortleash.toml
+budget = 2.50        # USD
+max_spawns = 10
+max_tokens = 800000
+timeout = 900        # seconds
+forecast = true
+profile = "docs"     # baseline name for --anomaly
+
+[hook]               # used only by `shortleash hook`
+max_spawns = 12
+```
+
+`shortleash run` looks in the current folder and then in each folder above
+it, uses the first file it finds and says so (`limits from <path>`). A flag on
+the command line always beats the file. `--config FILE` names a file;
+`--no-config` ignores it. Unknown keys, wrong types and negative numbers are
+an error (exit 2) rather than a limit that silently does nothing. The file
+cannot run anything. Python 3.11+ reads it with `tomllib`; on 3.10 a small
+built-in reader handles exactly the syntax above (numbers, strings, `true` /
+`false`, one level of `[table]`, `#` comments) and refuses anything else.
+
+## Hook mode (`shortleash hook`) — a spawn limit inside a session
+
+`shortleash run` wraps one command. If you work in an interactive Claude Code
+session, install the hook instead and Claude Code asks shortleash before each
+subagent:
+
+```bash
+shortleash hook install --max-spawns 8      # ~/.claude/settings.json
+shortleash hook install --scope project     # ./.claude/settings.json
+shortleash hook install --dry-run           # print, change nothing
+shortleash hook status                      # what recent sessions started
+shortleash hook uninstall                   # removes exactly what install added
+```
+
+Two entries are merged into the `hooks` of your settings file (the schema
+was checked against https://code.claude.com/docs/en/hooks in October 2026 and
+lives in one function, `hook_entries()`):
+
+- `PreToolUse`, matcher `Agent|Task`: counts the session's subagent starts
+  and, past the limit, answers `permissionDecision: "deny"` with a reason
+  Claude reads. This is what stops a spawn.
+- `SubagentStart`: records the agent type for `hook status`. Per the docs it
+  cannot block anything.
+
+Install never overwrites or reorders your own hooks, keeps a `.bak` copy,
+keeps your indentation and line endings, refuses a settings file that is not
+valid JSON, and running it twice changes nothing. The command written is the
+absolute path of the `shortleash` console script; if that cannot be found it
+falls back to `python -I -m shortleash` with the absolute interpreter, and
+tells you, because that form only works while this Python can still import
+shortleash. The cap comes from `$SHORTLEASH_MAX_SPAWNS`, then `.shortleash.toml`
+(`[hook]` first), then what `install --max-spawns` saved.
+
+What hook mode **cannot** do:
+
+- It cannot stop a subagent that is already running or give back tokens
+  already spent; it refuses the next start.
+- It counts spawns, not money. Budget and token caps need `shortleash run`.
+- It counts per `session_id`; a new session starts at zero.
+- A resumed subagent or an agent-team message is not an `Agent` tool call and
+  is not counted.
+- It **fails open**: if the command moved, Python is gone or the state folder
+  is not writable, Claude Code carries on and nothing is limited. `hook
+  status` shows whether it has been counting.
+- Anyone who can edit your Claude Code settings can remove it.
+- It has been checked against the documentation and with simulated hook
+  input, never run by a real Claude Code (see the limits below).
 
 ## Usage
 
@@ -556,7 +670,7 @@ returns and kills the whole tree, sends the leash itself Ctrl-C and SIGTERM
 at a temp dir). The Windows shim resolution and the cmd.exe refusal list
 are unit-tested with a fake shim directory on every platform.
 
-## Scope / limits (v0.1.5)
+## Scope / limits (v0.2.0)
 
 - Claude Code `-p` (non-interactive) is the supported path. Interactive
   sessions and other agents (Codex, Cursor) are on the roadmap — the
@@ -593,7 +707,9 @@ are unit-tested with a fake shim directory on every platform.
   covered by tests that run on Windows too (the suite passed there on Python
   3.11 for 0.1.2), but they were developed on Linux: no file written by a real
   PowerShell 5 was read.
-- **What 0.1.5 was run on:** Linux only, Python 3.10, 3.13 and 3.14 and the
+- **Hook mode and the spawn counter were never run by a real Claude Code,
+  and the culprit/forecast text was only seen on made-up streams.**
+- **What 0.2.0 was run on:** Linux only, Python 3.10, 3.13 and 3.14 and the
   unpacked source archive. Not on Windows or macOS, and not against a real `claude`. Agent names
   in other letter cases are tested by name (and with a script really called
   `Claude` on POSIX), a Python without `sqlite3` is simulated, and the

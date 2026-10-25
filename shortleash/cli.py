@@ -6,6 +6,8 @@ cap, token cap, or wall-clock timeout. Emits a per-run receipt.
 
 Subcommands:
   run    the leash (this tool's purpose)
+  hook   Claude Code hooks: a spawn limit inside an ordinary session
+         (`hook install`, `hook uninstall`, `hook status`)
   fleet  see who holds a fleet claim (`fleet list`)
   cache  a separate helper: the prompt-caching optimizer (cacheopt.py).
          It shares nothing with the leash but the package; see the README
@@ -15,14 +17,18 @@ Subcommands:
 import argparse
 import errno
 import atexit
+import json
 import math
 import os
 import sys
+import time
 
 from . import cacheopt
 from . import fleet as fleet_mod
 from . import guard as guard_mod
+from . import hookmode
 from . import pricing
+from . import profile as profile_mod
 from . import __version__
 
 DEFAULT_ANOMALY = 3.0
@@ -53,7 +59,10 @@ def _add_run_parser(sub) -> None:
                    help="Max estimated spend in USD before the run is killed "
                         "(a finite number >= 0).")
     r.add_argument("--max-spawns", type=int, default=None,
-                   help="Max subagent spawns before the run is killed.")
+                   help="Spawn-storm guard: stop the run when the agent "
+                        "starts more than this many subagents. It stops "
+                        "quickly, not instantly: subagents already started "
+                        "may have spent tokens (a whole number >= 0).")
     r.add_argument("--max-tokens", type=int, default=None,
                    help="Max total tokens (in+out+cache) before the run is killed.")
     r.add_argument("--timeout", type=float, default=None,
@@ -113,6 +122,14 @@ def _add_run_parser(sub) -> None:
                    help=f"Claim TTL in seconds, 1 to {fleet_mod.MAX_TTL} "
                         f"(default {fleet_mod.DEFAULT_TTL}); a value outside "
                         "that range is refused.")
+    r.add_argument("--no-forecast", action="store_true",
+                   help="Turn the early-warning lines off (a budget or token "
+                        "cap, 20%%/50%%/80%% used, at the pace so far).")
+    r.add_argument("--config", metavar="FILE", default=None,
+                   help="Read limits from this .shortleash.toml instead of "
+                        "looking for one in the current folder and above.")
+    r.add_argument("--no-config", action="store_true",
+                   help="Ignore any .shortleash.toml.")
     r.add_argument("command", nargs=argparse.REMAINDER,
                    help="Command to run, after -- : shortleash run --budget 2 -- claude -p ...")
 
@@ -121,6 +138,38 @@ def _add_fleet_parser(sub) -> None:
     f = sub.add_parser("fleet", help="Fleet claims held on this machine.")
     fsub = f.add_subparsers(dest="fleet_cmd", required=True)
     fsub.add_parser("list", help="Show who currently holds which path.")
+
+
+def _add_hook_parser(sub) -> None:
+    h = sub.add_parser(
+        "hook", help="Claude Code hooks: a spawn limit for ordinary "
+                     "sessions.")
+    hsub = h.add_subparsers(dest="hook_cmd", required=True)
+    ins = hsub.add_parser(
+        "install", help="Add the two hooks to your Claude Code settings "
+                        "(nothing of yours is changed or removed).")
+    ins.add_argument("--max-spawns", type=int, default=None, metavar="N",
+                     help="Deny the (N+1)th subagent start of a session. "
+                          "Without it the limit comes from $SHORTLEASH_MAX_"
+                          "SPAWNS or a .shortleash.toml.")
+    ins.add_argument("--scope", choices=["user", "project", "local"],
+                     default="user",
+                     help="user: ~/.claude/settings.json (default); project: "
+                          "./.claude/settings.json; local: "
+                          "./.claude/settings.local.json.")
+    ins.add_argument("--settings", metavar="FILE", default=None,
+                     help="Settings file to change (overrides --scope).")
+    ins.add_argument("--dry-run", action="store_true",
+                     help="Print the hooks and change nothing.")
+    un = hsub.add_parser("uninstall", help="Remove exactly the hooks "
+                                           "`hook install` added.")
+    un.add_argument("--scope", choices=["user", "project", "local"],
+                    default="user")
+    un.add_argument("--settings", metavar="FILE", default=None)
+    hsub.add_parser("status", help="Show what recent sessions have started.")
+    # Called by Claude Code, not by people:
+    hsub.add_parser("pretool", help=argparse.SUPPRESS)
+    hsub.add_parser("subagent-start", help=argparse.SUPPRESS)
 
 
 def _add_cache_parser(sub) -> None:
@@ -155,6 +204,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
     _add_run_parser(sub)
+    _add_hook_parser(sub)
     _add_fleet_parser(sub)
     _add_cache_parser(sub)
     return p
@@ -264,6 +314,152 @@ def _cmd_fleet(args) -> int:
     return 0
 
 
+def _apply_profile(args) -> int:
+    """Fill the limits the command line left unset from .shortleash.toml.
+    Returns an exit code (2) when the file is unusable, else 0. The flag
+    always wins over the file."""
+    args.profile_file = None
+    if args.no_config:
+        return 0
+    try:
+        path = args.config or profile_mod.find()
+        if not path:
+            return 0
+        data = profile_mod.load(path)
+    except (OSError, profile_mod.ProfileError) as e:
+        text = str(e) if isinstance(e, profile_mod.ProfileError) \
+            else f"cannot read {args.config}: {e.strerror or e}"
+        print(f"shortleash: error: {text}", file=sys.stderr)
+        return 2
+    args.profile_file = path
+    for key in ("budget", "max_spawns", "max_tokens", "timeout"):
+        if getattr(args, key) is None and key in data:
+            setattr(args, key, data[key])
+    if args.anomaly is None and not args.no_anomaly and "anomaly" in data:
+        args.anomaly = data["anomaly"]
+    if not args.profile and "profile" in data:
+        args.profile = data["profile"]
+    if not args.no_forecast and data.get("forecast") is False:
+        args.no_forecast = True
+    return 0
+
+
+def _read_stdin() -> str:
+    try:
+        return sys.stdin.read(1024 * 1024)
+    except (OSError, ValueError, AttributeError, UnicodeDecodeError):
+        return ""
+
+
+def _hook_settings_file(args) -> str:
+    return args.settings or hookmode.settings_path(args.scope)
+
+
+def _cmd_hook(args) -> int:
+    cmd = args.hook_cmd
+    if cmd in ("pretool", "subagent-start"):
+        # Claude Code calls these on every subagent start: quiet, fast,
+        # and never a traceback (see hookmode: they fail open).
+        text = _read_stdin()
+        out, rc = (hookmode.run_pretool(text) if cmd == "pretool"
+                   else hookmode.run_subagent_start(text))
+        if out:
+            print(out)
+        return rc
+    try:
+        if cmd == "install":
+            return _hook_install(args)
+        if cmd == "uninstall":
+            return _hook_uninstall(args)
+        return _hook_status()
+    except hookmode.HookError as e:
+        print(f"shortleash: error: {e}", file=sys.stderr)
+        return 2
+
+
+def _hook_install(args) -> int:
+    if args.max_spawns is not None and args.max_spawns < 0:
+        print("shortleash: error: --max-spawns must be >= 0", file=sys.stderr)
+        return 2
+    path = _hook_settings_file(args)
+    base = hookmode.self_command()
+    if hookmode.console_script() is None:
+        print("shortleash: warning: the `shortleash` command was not found "
+              "next to this Python (a source checkout?), so the hooks run "
+              "`python -I -m shortleash`. That works only while shortleash "
+              "is installed for that Python (`pip install .` in the "
+              "checkout); otherwise the hooks do nothing, silently.",
+              file=sys.stderr)
+    if args.dry_run:
+        print(json.dumps({"hooks": {
+            event: [entry] for event, entry
+            in hookmode.hook_entries(base).items()}}, indent=2))
+        print(f"\n(dry run: {path} was not changed)")
+        return 0
+    changed = hookmode.update_settings(
+        path, lambda settings: hookmode.merge_hooks(settings, base))
+    if args.max_spawns is not None:
+        hookmode.write_default_cap(args.max_spawns)
+    hookmode.prune()
+    print(f"{'Added the hooks to' if changed else 'Hooks already in'} {path}"
+          + (" (your previous file is kept next to it as .bak)"
+             if changed else ""))
+    print("  PreToolUse on Agent|Task: refuses a subagent start once a "
+          "session is over its limit")
+    print("  SubagentStart: notes which kind of subagent started "
+          "(`shortleash hook status`)")
+    cap, where = hookmode.resolve_cap(os.getcwd())
+    if cap is None:
+        print("No limit is set yet, so nothing is refused: pass "
+              "--max-spawns N, set $SHORTLEASH_MAX_SPAWNS, or put "
+              "max_spawns in a .shortleash.toml.")
+    else:
+        print(f"Limit: {cap} subagent starts per session (from {where}).")
+    print("It cannot: stop a subagent that is already running, take back "
+          "tokens already spent, limit cost (use `shortleash run` for "
+          "that), or work if the command is moved away.")
+    return 0
+
+
+def _hook_uninstall(args) -> int:
+    path = _hook_settings_file(args)
+    if not os.path.exists(path):
+        print(f"{path} does not exist; nothing to remove")
+        return 0
+    count = [0]
+
+    def change(settings):
+        count[0] = hookmode.remove_hooks(settings)
+    hookmode.update_settings(path, change)
+    print(f"Removed {count[0]} shortleash hook(s) from {path}; "
+          f"every other setting was left as it was.")
+    return 0
+
+
+def _hook_status() -> int:
+    mine = [(scope, hookmode.settings_path(scope)) for scope in
+            ("user", "project", "local")]
+    for scope, path in mine:
+        events = hookmode.installed_in(path)
+        print(f"{scope:8} {path}: "
+              + (", ".join(events) if events else "not installed"))
+    cap, where = hookmode.resolve_cap(os.getcwd())
+    print("limit:   " + (f"{cap} per session (from {where})" if cap is not None
+                         else "none set (nothing is refused)"))
+    rows = hookmode.sessions()
+    if not rows:
+        print("no sessions counted yet")
+        return 0
+    print("recent sessions (newest first):")
+    for r in rows:
+        kinds = ", ".join(f"{k} x{v}" for k, v in sorted(
+            r["agents"].items(), key=lambda kv: -kv[1])[:4]) or "-"
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["last"]))
+        print(f"  {r['session'][:12]:12} {when}  asked {r['requests']}, "
+              f"refused {r['denied']}, started {r['started']}  [{kinds}]")
+    return 0
+
+
 def _fleet_db() -> str:
     return fleet_mod.DB_PATH or fleet_mod.paths.fleet_db_path()
 
@@ -344,7 +540,12 @@ def main(argv: list[str] | None = None) -> int:
         return _print_command(_cmd_cache, args)
     if args.cmd == "fleet":
         return _print_command(_cmd_fleet, args)
+    if args.cmd == "hook":
+        return _print_command(_cmd_hook, args)
     if args.cmd == "run":
+        merged = _apply_profile(args)
+        if merged:
+            return merged
         # A cap that is NaN or infinite compares False with everything: it
         # would never trip, yet the banner and the receipt would list it as
         # enforced. Refuse it before anything is spent.
@@ -411,14 +612,18 @@ def main(argv: list[str] | None = None) -> int:
             history_path=args.history_path,
             min_history=args.min_history,
             redact_prompt=args.redact_prompt,
+            forecast=not args.no_forecast,
         )
         if not args.quiet:
             # Never echo the full argv: it may contain secrets. Show only
             # the agent binary name alongside the caps.
             agent_bin = guard_mod.agent_name(cmd[0])
+            source = (f"[shortleash] limits from {args.profile_file}\n"
+                      if args.profile_file else "")
             _stderr_write(
                 f"[shortleash] guarding: {agent_bin}\n"
                 f"[shortleash] {_caps_banner(args)}\n"
+                f"{source}"
                 f"[shortleash] pricing: {pricing_table.describe()}\n"
             )
         if args.fleet:

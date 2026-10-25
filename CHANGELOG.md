@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0
+
+- Spawn-storm guard: `--max-spawns` now explains itself. When it trips, the receipt says what to do and that the run stops quickly, not instantly.
+- The receipt names the culprit: `38 spawns, 71% of tokens in agent Explore` (new `culprit` and `agents` fields in the JSON receipt).
+- `.shortleash.toml`: per-repo limits (budget, max_spawns, max_tokens, timeout, forecast, profile). Flags win over the file. `--config`, `--no-config`.
+- Early-warning forecast at 20%, 50% and 80% of a budget or token cap, at the pace so far. `--no-forecast` turns it off.
+- `shortleash hook install | uninstall | status`: a Claude Code PreToolUse hook that denies the subagent start past a per-session cap, and a SubagentStart hook that records agent types. Your own hooks are never changed. It fails open and cannot stop a running subagent; the README lists what it cannot do.
+
 ## 0.1.5
 
 - Release workflow: the tag check read a version from `pyproject.toml` that does not exist here (the version is dynamic), so a correct tag failed. The check now compares the tag with the version in the built file names (`.github/scripts/release_check.py`), and refuses a tag whose commit is not on `main`.
