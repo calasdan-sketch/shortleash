@@ -145,6 +145,51 @@ What hook mode **cannot** do:
 - It has been checked against the documentation and with simulated hook
   input, never run by a real Claude Code (see the limits below).
 
+### Repeat-call guard (`hook install --loop-guard`)
+
+A stuck agent often repeats one tool call: the same failing command, the same
+read. Each repeat costs a whole turn. With the guard on, the PreToolUse hook
+runs for every tool (matcher `*`) and keeps, per session, a small ring buffer
+of **fingerprints**: the tool name plus a SHA-256 of its input with keys
+sorted and white space collapsed. Only the fingerprint, the tool name, the
+`tool_use_id` and a time are stored, never the input. The file is
+`~/.shortleash/hooks/<session>.loop` (0600, folder 0700) and is pruned after 7
+days like the other state.
+
+```bash
+shortleash hook install --loop-guard                       # warn at 4, refuse at 8, among the last 20
+shortleash hook install --loop-warn 3 --loop-deny 6 --loop-window 12
+shortleash hook install --velocity-usd-per-min 1.5         # optional spend warning
+shortleash hook install --no-loop-guard                    # off again (matcher back to Agent|Task)
+```
+
+- **Warn** (`loop_warn`, default 4): the call is allowed. Claude gets an
+  `additionalContext` note and you get a `systemMessage`. No
+  `permissionDecision` is sent, because `"allow"` would also skip your
+  permission prompt.
+- **Refuse** (`loop_deny`, default 8): `permissionDecision: "deny"` with a
+  reason Claude reads. The refused calls stay in the window, so the loop has
+  to be broken, not just retried; once the identical calls slide out of the
+  last `loop_window` calls (or are an hour old) the tool works again.
+- `0` switches a level off. Settings come, per key, from `$SHORTLEASH_LOOP_WARN`,
+  `_DENY`, `_WINDOW`, `$SHORTLEASH_VELOCITY_USD_PER_MIN` (and
+  `$SHORTLEASH_LOOP_GUARD=off`), then `[hook]` in `.shortleash.toml`
+  (`loop_warn`, `loop_deny`, `loop_window`, `velocity_usd_per_min`), then what
+  `install` saved. Nothing set = the guard is off.
+- **Spend velocity** (off unless a limit is set): the hook reads the last
+  megabyte of the session transcript (`transcript_path`), prices the
+  assistant messages of the last five minutes with shortleash's price table
+  and warns (never refuses) above your limit, at most once in ten minutes. It
+  is an estimate from a file Claude Code does not document; with no readable
+  data it says nothing. For money you can enforce, use `shortleash run`.
+
+What it does not do: it catches **identical** calls, not near-identical ones
+(a loop that changes one character each time is not seen); it cannot take back
+tokens already spent; it starts a process for every tool call (a few tens of
+milliseconds); and it **fails open** like the rest of hook mode: any problem,
+an unwritable folder, a corrupt file, is an allow. A parallel batch of calls
+may be counted one call late.
+
 ## `shortleash init` and `shortleash report`
 
 `shortleash init` is the one-command start: it installs the hook (the same

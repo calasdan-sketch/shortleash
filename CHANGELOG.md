@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Repeat-call guard for hook mode (`shortleash hook install --loop-guard`): a per-session ring buffer of tool-call fingerprints (tool name + hash of the canonical input; the input itself is never stored) warns at the 4th identical call among the last 20 and refuses at the 8th; levels, window and an optional spend-velocity warning are settable by flag, environment, `[hook]` in `.shortleash.toml` or the install. Warnings use `additionalContext` and `systemMessage` and never send an `allow`. Off unless asked for; fails open; documented limits in the README.
+
 ## 0.2.0
 
 - `shortleash init` (hook plus a starter `.shortleash.toml`: $5, 10 spawns, 30 minutes) and `shortleash report` (cost per agent and day from the history file).

@@ -10,6 +10,10 @@
 
     [hook]               # only for `shortleash hook` (Claude Code hooks)
     max_spawns = 12
+    loop_warn = 4        # repeat-call guard: warn / deny at N identical
+    loop_deny = 8        # calls among the last loop_window (20) calls;
+    loop_window = 20     # any of them turns the guard on
+    velocity_usd_per_min = 1.5   # optional spend-velocity warning
 
 `shortleash run` looks for the file in the current folder and then in each
 folder above it; the first one found is used, and a flag on the command
@@ -42,7 +46,8 @@ MAX_BYTES = 64 * 1024
 TOP_KEYS = {"budget": "number", "max_spawns": "int", "max_tokens": "int",
             "timeout": "positive", "anomaly": "positive",
             "forecast": "bool", "profile": "string"}
-HOOK_KEYS = {"max_spawns": "int"}
+HOOK_KEYS = {"max_spawns": "int", "loop_warn": "int", "loop_deny": "int",
+             "loop_window": "int", "velocity_usd_per_min": "positive"}
 
 
 class ProfileError(ValueError):

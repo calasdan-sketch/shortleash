@@ -7,7 +7,8 @@ cap, token cap, or wall-clock timeout. Emits a per-run receipt.
 Subcommands:
   run    the leash (this tool's purpose)
   hook   Claude Code hooks: a spawn limit inside an ordinary session
-         (`hook install`, `hook uninstall`, `hook status`)
+         (`hook install`, `hook uninstall`, `hook status`),
+         with an optional repeat-call guard (`hook install --loop-guard`)
   fleet  see who holds a fleet claim (`fleet list`)
   cache  a separate helper: the prompt-caching optimizer (cacheopt.py).
          It shares nothing with the leash but the package; see the README
@@ -27,6 +28,7 @@ from . import cacheopt
 from . import fleet as fleet_mod
 from . import guard as guard_mod
 from . import hookmode
+from . import loopguard as loopguard_mod
 from . import pricing
 from . import profile as profile_mod
 from . import __version__
@@ -152,6 +154,26 @@ def _add_hook_parser(sub) -> None:
                      help="Deny the (N+1)th subagent start of a session. "
                           "Without it the limit comes from $SHORTLEASH_MAX_"
                           "SPAWNS or a .shortleash.toml.")
+    ins.add_argument("--loop-guard", action="store_true",
+                     help="Also watch for a repeated tool call: warn at the "
+                          "4th identical call among the last 20 and refuse "
+                          "at the 8th. Makes the PreToolUse hook run for "
+                          "every tool.")
+    ins.add_argument("--no-loop-guard", action="store_true",
+                     help="Switch the repeat-call guard off again.")
+    ins.add_argument("--loop-warn", type=int, default=None, metavar="N",
+                     help="Warn at N identical calls (default 4; 0 = never). "
+                          "Implies --loop-guard.")
+    ins.add_argument("--loop-deny", type=int, default=None, metavar="M",
+                     help="Refuse at M identical calls (default 8; 0 = "
+                          "never). Implies --loop-guard.")
+    ins.add_argument("--loop-window", type=int, default=None, metavar="W",
+                     help="Count among the last W tool calls (default 20). "
+                          "Implies --loop-guard.")
+    ins.add_argument("--velocity-usd-per-min", type=float, default=None,
+                     metavar="USD", help="Warn when the session's estimated "
+                     "spend over the last five minutes exceeds USD per "
+                     "minute. Implies --loop-guard.")
     ins.add_argument("--scope", choices=["user", "project", "local"],
                      default="user",
                      help="user: ~/.claude/settings.json (default); project: "
@@ -448,6 +470,10 @@ def _hook_install(args) -> int:
     if args.max_spawns is not None and args.max_spawns < 0:
         print("shortleash: error: --max-spawns must be >= 0", file=sys.stderr)
         return 2
+    loop_cfg, loop_flag, bad = _loop_args(args)
+    if bad:
+        print(f"shortleash: error: {bad}", file=sys.stderr)
+        return 2
     path = _hook_settings_file(args)
     base = hookmode.self_command()
     if hookmode.console_script() is None:
@@ -460,13 +486,19 @@ def _hook_install(args) -> int:
     if args.dry_run:
         print(json.dumps({"hooks": {
             event: [entry] for event, entry
-            in hookmode.hook_entries(base).items()}}, indent=2))
+            in hookmode.hook_entries(base, bool(loop_flag)).items()}},
+            indent=2))
         print(f"\n(dry run: {path} was not changed)")
         return 0
     changed = hookmode.update_settings(
-        path, lambda settings: hookmode.merge_hooks(settings, base))
+        path, lambda settings: hookmode.merge_hooks(
+            settings, base, loop_flag))
     if args.max_spawns is not None:
         hookmode.write_default_cap(args.max_spawns)
+    if loop_flag is True:
+        hookmode.write_loop_config(loop_cfg)
+    elif loop_flag is False:
+        hookmode.write_loop_config(None)
     hookmode.prune()
     print(f"{'Added the hooks to' if changed else 'Hooks already in'} {path}"
           + (" (your previous file is kept next to it as .bak)"
@@ -475,6 +507,15 @@ def _hook_install(args) -> int:
           "session is over its limit")
     print("  SubagentStart: notes which kind of subagent started "
           "(`shortleash hook status`)")
+    if loop_flag is True:
+        c = loopguard_mod.finish([loop_cfg])
+        print(f"  Repeat-call guard (PreToolUse on every tool): warn at "
+              f"{c['warn'] or 'never'}, refuse at {c['deny'] or 'never'} "
+              f"identical calls among the last {c['window']}"
+              + (f"; velocity warning above ${c['velocity']:g}/min"
+                 if c.get("velocity") else ""))
+        print("    It fails open, sees identical calls only, and runs a "
+              "process for every tool call.")
     cap, where = hookmode.resolve_cap(os.getcwd())
     if cap is None:
         print("No limit is set yet, so nothing is refused: pass "
@@ -486,6 +527,35 @@ def _hook_install(args) -> int:
           "tokens already spent, limit cost (use `shortleash run` for "
           "that), or work if the command is moved away.")
     return 0
+
+
+def _loop_args(args):
+    """(settings dict for the guard or None, True/False/None = on/off/leave,
+    problem text or "")."""
+    get = lambda name: getattr(args, name, None)  # noqa: E731 - init has none
+    given = {"warn": get("loop_warn"), "deny": get("loop_deny"),
+             "window": get("loop_window"),
+             "velocity": get("velocity_usd_per_min")}
+    for name, value in (("--loop-warn", given["warn"]),
+                        ("--loop-deny", given["deny"]),
+                        ("--loop-window", given["window"])):
+        if value is not None and value < 0:
+            return None, None, f"{name} must be >= 0"
+    if given["velocity"] is not None and not (given["velocity"] > 0):
+        return None, None, "--velocity-usd-per-min must be greater than 0"
+    if get("no_loop_guard"):
+        if get("loop_guard") or any(v is not None for v in given.values()):
+            return None, None, ("--no-loop-guard cannot be combined with "
+                                "the other loop options")
+        return None, False, ""
+    if not (get("loop_guard") or any(v is not None for v in given.values())):
+        return None, None, ""
+    cfg = {k: v for k, v in given.items() if v is not None}
+    full = loopguard_mod.finish([cfg or {"warn": loopguard_mod.DEFAULT_WARN}])
+    why = loopguard_mod.problems(full)
+    if why:
+        return None, None, why[0]
+    return cfg or {"warn": loopguard_mod.DEFAULT_WARN}, True, ""
 
 
 def _hook_uninstall(args) -> int:
@@ -513,6 +583,12 @@ def _hook_status() -> int:
     cap, where = hookmode.resolve_cap(os.getcwd())
     print("limit:   " + (f"{cap} per session (from {where})" if cap is not None
                          else "none set (nothing is refused)"))
+    lc = hookmode.resolve_loop(os.getcwd())
+    print("repeat-call guard: " + (
+        f"warn at {lc['warn'] or 'never'}, refuse at {lc['deny'] or 'never'} "
+        f"identical calls among the last {lc['window']}"
+        + (f"; velocity above ${lc['velocity']:g}/min" if lc["velocity"]
+           else "") if lc else "off"))
     rows = hookmode.sessions()
     if not rows:
         print("no sessions counted yet")
