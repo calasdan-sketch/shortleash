@@ -83,7 +83,7 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
     # later DB_PATH reassignment.
     if db_path is None:
         db_path = DB_PATH or paths.fleet_db_path()
-    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    paths.private_dir(os.path.dirname(os.path.abspath(db_path)))
     conn = sqlite3.connect(db_path, timeout=5.0)
     conn.executescript(SCHEMA)
     conn.execute("PRAGMA busy_timeout=5000")

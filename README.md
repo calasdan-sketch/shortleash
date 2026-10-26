@@ -1,11 +1,13 @@
 # ShortLeash — stop runaway agents
 
-A circuit breaker for AI coding-agent runs. Wraps an agent command, tails its
+**A seatbelt, not a sandbox.** A circuit breaker for AI coding-agent runs — and a spawn-storm guard. Wraps an agent command, tails its
 telemetry in real time, and **kills the run the moment it breaches a guardrail**
 — budget, subagent-spawn cap, token cap, or wall-clock timeout. Emits a
 per-run receipt showing what it cost and why it stopped. "The moment" needs
 an agent that streams its usage; an agent that only reports at the end can be
 checked, but no longer stopped (see *Live, or only afterwards*).
+
+**Limits:** It is a seatbelt, not a sandbox: it stops a run that crosses a limit, but it cannot stop an agent from doing harm inside the limits, and `kill -9` of the leash itself leaves the agent running on macOS.
 
 Vendors' "budgets" only warn while the meter keeps running. This one halts.
 
@@ -14,17 +16,235 @@ Vendors' "budgets" only warn while the meter keeps running. This one halts.
 Zero dependencies — Python 3.10+ stdlib only.
 
 ```bash
-pip install git+https://github.com/calasdan-sketch/shortleash
+pip install shortleash
 shortleash run --budget 2.00 -- <command>
+
+# or from source
+pip install git+https://github.com/calasdan-sketch/shortleash
 
 # or, from a checkout, without installing:
 python3 -m shortleash run --budget 2.00 -- <command>
 ```
 
-Works on Linux, macOS and Windows 11 (Python 3.10+). On Windows, `claude`
+Written for Linux, macOS and Windows (Python 3.10+); the CI matrix runs the suite on those three systems. On Windows, `claude`
 is found through `PATHEXT` (the npm `claude.cmd` shim — see *Windows*
 below), and console output never dies on a cp1252 code page — unencodable
 characters are replaced.
+
+## Spawn-storm guard (`--max-spawns`)
+
+The failure that burns real money fast is an agent that launches subagents
+that launch more subagents. `--max-spawns N` counts every subagent launch in
+the stream and stops the run when the count goes past N:
+
+```
+$ shortleash run --max-spawns 3 -- claude -p "audit every package"
+  STOPPED:   spawn cap exceeded: 4 subagents > 3 max
+  culprit:   4 spawns, 87% of tokens in agent Explore
+  hint:      stopped by the spawn cap. The leash stops the run as soon as it
+             reads the launch that went over the limit, but subagents that had
+             already started may have used tokens by then. ...
+```
+
+(That output is from a made-up agent that prints a stream of launches, run
+with `python3 storm.py 8` in the 0.2.0 tests; it was not a real `claude` run.)
+
+It **stops quickly, not instantly**: the leash reads the launch, then kills the
+process tree; subagents already running may spend tokens in between, and an
+agent that reports only at the end cannot be stopped live at all (see *Live,
+or only afterwards*). Treat it as a brake, not a guarantee.
+
+**The culprit line.** When a cap trips, the receipt (and the JSON receipt's
+`culprit` and `agents` fields) say which kind of agent used the tokens that
+grew since the last event, for example `38 spawns, 71% of tokens in agent
+Explore`, or `most tokens (62%) were used in the main conversation` when the
+subagents were not the problem. Tokens are attributed by the event that
+reported them (`parent_tool_use_id`); an event that names no agent counts as
+the main conversation.
+
+**Early warning (forecast).** With a `--budget` or `--max-tokens` cap, a line
+like `forecast: $0.55 of the $2.00 budget used after 1m 10s (27%); at this
+pace the budget is used up in about 3m 5s` is printed the first time the run
+passes 20%, then 50% and 80%. It is the pace so far carried forward, nothing
+smarter, so a bursty run will not match it. It stays quiet during the first
+five seconds and when the cap is more than an hour away. It never stops
+anything. `--no-forecast` turns it off.
+
+## Per-repo limits (`.shortleash.toml`)
+
+Put the limits next to the code so everyone who runs the agent in that repo
+gets them:
+
+```toml
+# .shortleash.toml
+budget = 2.50        # USD
+max_spawns = 10
+max_tokens = 800000
+timeout = 900        # seconds
+forecast = true
+profile = "docs"     # baseline name for --anomaly
+
+[hook]               # used only by `shortleash hook`
+max_spawns = 12
+```
+
+`shortleash run` looks in the current folder and then in each folder above
+it, uses the first file it finds and says so (`limits from <path>`). A flag on
+the command line always beats the file. `--config FILE` names a file;
+`--no-config` ignores it. Unknown keys, wrong types and negative numbers are
+an error (exit 2) rather than a limit that silently does nothing. The file
+cannot run anything. Python 3.11+ reads it with `tomllib`; on 3.10 a small
+built-in reader handles exactly the syntax above (numbers, strings, `true` /
+`false`, one level of `[table]`, `#` comments) and refuses anything else.
+
+## Hook mode (`shortleash hook`) — a spawn limit inside a session
+
+`shortleash run` wraps one command. If you work in an interactive Claude Code
+session, install the hook instead and Claude Code asks shortleash before each
+subagent:
+
+```bash
+shortleash hook install --max-spawns 8      # ~/.claude/settings.json
+shortleash hook install --scope project     # ./.claude/settings.json
+shortleash hook install --dry-run           # print, change nothing
+shortleash hook status                      # what recent sessions started
+shortleash hook uninstall                   # removes exactly what install added
+```
+
+Two entries are merged into the `hooks` of your settings file (the schema
+was checked against https://code.claude.com/docs/en/hooks in October 2026 and
+lives in one function, `hook_entries()`):
+
+- `PreToolUse`, matcher `Agent|Task`: counts the session's subagent starts
+  and, past the limit, answers `permissionDecision: "deny"` with a reason
+  Claude reads. This is what stops a spawn.
+- `SubagentStart`: records the agent type for `hook status`. Per the docs it
+  cannot block anything.
+
+Install never overwrites or reorders your own hooks, keeps a `.bak` copy,
+keeps your indentation and line endings, refuses a settings file that is not
+valid JSON, and running it twice changes nothing. The command written is the
+absolute path of the `shortleash` console script; if that cannot be found it
+falls back to `python -I -m shortleash` with the absolute interpreter, and
+tells you, because that form only works while this Python can still import
+shortleash. The cap comes from `$SHORTLEASH_MAX_SPAWNS`, then `.shortleash.toml`
+(`[hook]` first), then what `install --max-spawns` saved.
+
+What hook mode **cannot** do:
+
+- It cannot stop a subagent that is already running or give back tokens
+  already spent; it refuses the next start.
+- It counts spawns, not money. Budget and token caps need `shortleash run`.
+- It counts per `session_id`; a new session starts at zero.
+- A resumed subagent or an agent-team message is not an `Agent` tool call and
+  is not counted.
+- It **fails open**: if the command moved, Python is gone or the state folder
+  is not writable, Claude Code carries on and nothing is limited. `hook
+  status` shows whether it has been counting.
+- Anyone who can edit your Claude Code settings can remove it.
+- It has been checked against the documentation and with simulated hook
+  input, never run by a real Claude Code (see the limits below).
+
+### Repeat-call guard (`hook install --loop-guard`)
+
+A stuck agent often repeats one tool call: the same failing command, the same
+read. Each repeat costs a whole turn. With the guard on, the PreToolUse hook
+runs for every tool (matcher `*`) and keeps, per session, a small append-only
+log of **fingerprints**: the tool name plus a SHA-256 of the whole tool input
+(keys sorted; white space is collapsed **only** in a Bash/PowerShell `command`,
+every other input, an edit for instance, is compared exactly). Only the
+fingerprint, the tool name, the `tool_use_id` and a time are stored, never the
+input. The file is `~/.shortleash/hooks/<session>.loop` (0600, folder 0700) and
+is pruned after 7 days.
+
+```bash
+shortleash hook install --loop-guard                  # warn at the 6th identical call IN A ROW; refuses nothing
+shortleash hook install --loop-warn 8 --loop-deny 15 # also refuse at 15 in a row (12 or more)
+shortleash hook install --loop-deny 8 --force-low     # lower than 12 only on purpose
+shortleash hook install --loop-mode window --loop-window 20 --loop-warn 4
+shortleash hook install --velocity-usd-per-min 1.5    # optional spend warning
+shortleash hook install --no-loop-guard               # off again (matcher back to Agent|Task)
+```
+
+- **Consecutive (the default metric):** the same call N times *in a row*. A
+  different call in between starts the count again, so the ordinary
+  edit / test / edit / test cycle is never counted. **Window mode** (optional)
+  counts identical calls among the last `loop_window` (20) calls.
+- **Warn** (`loop_warn`, default 6 in a row; 4 in window mode): the call is
+  allowed. Claude gets an `additionalContext` note and you get a
+  `systemMessage`. No `permissionDecision` is sent, because `"allow"` would also
+  skip your permission prompt.
+- **Refuse is off by default.** Set `loop_deny` (at least 12 unless you pass
+  `--force-low`) and the call is answered `permissionDecision: "deny"` with a
+  reason Claude reads. A refused call is **not recorded**, so one different call
+  in between ends the refusal at once.
+- **False positives you should expect.** The hook sees calls, never their
+  results (there is no PostToolUse). Re-running the same test command with
+  nothing changed in between, polling a status command (`git status`, a `curl`
+  to a status page) and re-reading one file all look like a loop. That is why
+  it warns by default and only refuses if you ask. Warnings are advice to Claude
+  ("if you are legitimately waiting, carry on").
+- Settings come, per key, from `$SHORTLEASH_LOOP_WARN`, `_DENY`, `_WINDOW`,
+  `_MODE`, `$SHORTLEASH_VELOCITY_USD_PER_MIN` (and `$SHORTLEASH_LOOP_GUARD=off`),
+  then `[hook]` in `.shortleash.toml` (`loop_warn`, `loop_deny`, `loop_window`,
+  `loop_mode`, `velocity_usd_per_min`), then what `install` saved. Nothing set =
+  the guard is off. **A project file is not trusted to make the guard refuse
+  early:** a cloned repository's `.shortleash.toml` with `loop_deny` below 12 is
+  ignored (an environment variable or the install can set a lower number). It
+  can still turn the guard on and make it warn, or set `loop_warn = 1` to make
+  every call carry a warning (a nuisance, not a block).
+- **Spend velocity** (off unless a limit is set): the hook reads the last
+  megabyte of the session transcript (`transcript_path`), prices the assistant
+  messages of the last five minutes with shortleash's price table and warns
+  (never refuses) above your limit, at most once in ten minutes. It is an
+  estimate from a file Claude Code does not document; with no readable data it
+  says nothing. For money you can enforce, use `shortleash run`.
+
+**The cost of `*`.** The matcher `*` starts one Python process for every tool
+call. Measured on a Linux container (median of 30 calls, `python -I`, a bare
+interpreter alone took about 11 ms): **about 52 ms per tool call on Python
+3.10, 58 ms on 3.12 and 66 ms on 3.14**, nearly all of it importing shortleash.
+Your machine, and especially Windows with antivirus, will differ; the hook has a
+10 second timeout and fails open.
+
+**The shared-group limit.** Install changes the matcher to `*` only on a group
+that holds nothing but shortleash's own hook. If a hook of yours shares the
+`Agent|Task` group, the matcher is left alone and the guard would silently see
+only subagent calls. `hook install --loop-guard` now prints a warning in that
+case and `hook status` warns as long as it is true; move your hook to its own
+group and install again. `hook uninstall` removes the saved guard settings once
+no settings file has the hook any more.
+
+What it does not do: it catches **identical** calls, not near-identical ones (a
+loop that changes one character each time is not seen); it cannot take back
+tokens already spent; and it **fails open** like the rest of hook mode: any
+problem, an unwritable folder, a corrupt file, is an allow. Parallel calls are
+each appended with one write, so none is lost, but two calls made at the same
+instant may each count the other one late.
+
+## `shortleash init` and `shortleash report`
+
+`shortleash init` is the one-command start: it installs the hook (the same
+idempotent install as `hook install`, with a limit of 10 subagent starts per
+session unless you already set one) and writes a starter `.shortleash.toml` in
+the current folder: `budget = 5.00`, `max_spawns = 10`, `timeout = 1800`
+(30 minutes). A profile that already exists is never overwritten. `--dry-run`
+changes nothing; `--scope`/`--settings` pick the settings file.
+
+The early-warning lines at 20%, 50% and 80% of a budget or token cap
+(`forecast`, on by default) are the soft warning: they go to stderr and never
+stop anything.
+
+`shortleash report [--days 7] [--json]` sums the history file
+(`~/.shortleash/history.jsonl`): runs, cost and tokens per agent/profile and
+per UTC day. It counts only what the history holds (runs with telemetry); the
+costs are the receipts' estimates or the agent-reported totals, not an invoice.
+
+State files (`~/.shortleash`, the hook's session files) are created readable by
+you only (0700 folders, 0600 files, POSIX); hook session files older than 7
+days are removed when a new session starts. When the built-in price table is
+more than 90 days old (or a `--pricing` file has no usable `as_of`) `run`
+prints a warning on stderr.
 
 ## Usage
 
@@ -80,6 +300,16 @@ were not echoed`). How much of a fast burst still gets through depends on the
 reader and the machine; no amount is promised. If that reader is still stuck
 when the run ends, the leash gives up on it after two seconds without
 progress, so the summary and the exit code are not held hostage.
+
+Two limits you should know about. The unit that is queued, counted and
+dropped is a *piece* of up to 64 KB, not always a whole line: when a very
+long output line meets a full queue, the reader gets that line with a gap in
+it, and the warning's "line(s)" really counts pieces. And an output line
+longer than 8 million characters (8 MiB of text) is never parsed for
+telemetry at all: it is skipped, the receipt says so
+(`an agent output line longer than 8388608 characters was skipped`), and any
+usage inside it is not counted, so a cap cannot see it. Normal stream-json
+lines are far below that.
 
 Non-JSON lines on the agent's stdout (warnings, entrypoint chatter) are not
 telemetry and are ignored; a telemetry event whose fields are malformed
@@ -264,7 +494,7 @@ Every run ends with a receipt on stderr and optionally as JSON
   tokens:    51,000 (in=15,000 out=4,500 cache_r=30,000 cache_w=1,500)
   turns:     0   spawns: 1
   duration:  0.16s   exit: 124
-  pricing:   built-in fallback table as of 2026-10-16 — verify against provider pricing
+  pricing:   built-in fallback table as of 2026-10-24 — verify against provider pricing
   STOPPED:   budget exceeded: estimated $0.1271 > $0.05 cap
 ──────────────────────────────────────────────────
 ```
@@ -293,8 +523,19 @@ and such a run is not added to the history.
 
 `command` is the wrapped argv with **secret-looking values redacted**: the
 value after any flag whose name contains `key`, `token`, `secret`,
-`password` or `passwd` (`--api-key sk-…`, `--token=…`, `DB_PASSWORD=…`)
-becomes `***`. **The prompt is not a secret by that rule and is stored
+`password`, `passwd`, `bearer`, `credential` or `cookie`, or has `auth`
+(or `oauth`, `authorization`) as a whole word (`--api-key sk-…`,
+`--token=…`, `DB_PASSWORD=…`, `--cookie …`, `--auth x`) becomes `***`;
+`--author` is not touched. So does the value of `-u`/`--user` (also glued on,
+`-uuser:pass`), a `name:value` argument with such a name (`password:hunter2`),
+the `user:password@` part of a URL (`https://***@host/x`), the secret part of
+an HTTP header given with `-H`/`--header` (`Authorization: ***`), and any
+`sk-…` key (not inside a word, so `disk-usage-report` is safe), `Bearer …`
+credential, `Basic …` credential (only when it looks like base64: a word like
+`basic functionality` in a prompt is left alone) or GitHub / Slack / AWS token
+wherever it appears in an argument. This is pattern matching: a secret in an
+unusual shape is not recognised, so keep real secrets out of command lines.
+The receipt file is written with mode `0600` (owner only). **The prompt is not a secret by that rule and is stored
 verbatim** — `-p "my password is hunter2"` ends up in `receipt.json` as
 typed. Pass `--redact-prompt` to replace the argument after `-p`,
 `--print` or `--prompt` (and a `--prompt=…` value) with `<redacted>`; a
@@ -305,17 +546,18 @@ recognised. The history file never stores command text.
 
 The built-in table (`pricing.py`, USD per 1M tokens) is **not fetched from
 anywhere**; it was written on the date in `PRICING_AS_OF`. The startup banner
-says so (`pricing: built-in fallback table as of 2026-10-16 — verify against
+says so (`pricing: built-in fallback table as of 2026-10-24 — verify against
 provider pricing`; not under `--quiet`), the receipt on stderr repeats that
 line whenever the cost it shows is an estimate, and the JSON receipt always
 carries it (`pricing`: `as_of`, `source`). Check it against the provider's
-pricing page before trusting a `--budget` to the cent, and override it with
+pricing page (the built-in numbers were read from
+<https://platform.claude.com/docs/en/about-claude/pricing>) before trusting a `--budget` to the cent, and override it with
 `--pricing pricing.json` or the `SHORTLEASH_PRICING` environment variable
 pointing at a JSON file:
 
 ```json
-{"as_of": "2026-10-16",
- "sonnet": [3.0, 15.0], "opus": [15.0, 75.0], "haiku": [0.8, 4.0]}
+{"as_of": "2026-10-24",
+ "sonnet": [3.0, 15.0], "opus": [5.0, 25.0], "haiku": [1.0, 5.0]}
 ```
 
 `as_of` is optional metadata echoed in the receipt; every other key is a
@@ -341,6 +583,19 @@ A model that matches **no** entry is priced with the `default` entry
 stderr as soon as the model is known (not under `--quiet`), the same text
 as a receipt `warning:`, and `"price_assumed": true` in the receipt JSON.
 Add the model to your pricing file to silence it.
+
+The estimate prices two things roughly, both on the cautious or the
+cheap side as noted. A model the table does not name more precisely than its
+family is priced at the family rate: `claude-3-haiku` ($0.25 / $1.25 per 1M
+tokens) matches `haiku` and is priced as Haiku 4.5 ($1 / $5), so its estimate
+runs about four times high (add `{"3-haiku": [0.25, 1.25]}` to your pricing
+file to fix that). Cache reads are priced at 0.10x and cache writes at 1.25x
+the input rate, the 5-minute rate; a cache write kept for **1 hour** costs
+2x, and the leash does not model it (the stream does not say which kind a
+write was in the fields the leash reads), so a run that writes a lot of
+1-hour cache can cost up to 60% more on those tokens than the live estimate
+says. The agent's own `total_cost_usd` replaces the estimate in the final
+receipt when it is there.
 
 ### No telemetry, no comfort
 
@@ -501,6 +756,7 @@ exit `2`. (Before 0.1.2 the first and the last were a traceback and exit `1`.)
 
 ```bash
 python3 -m unittest discover -s tests -v   # or: python3 -m pytest -q
+# `-s tests -t .` works too
 ```
 
 The source distribution carries `tests/` and `sim/` as well, so the same
@@ -517,7 +773,7 @@ returns and kills the whole tree, sends the leash itself Ctrl-C and SIGTERM
 at a temp dir). The Windows shim resolution and the cmd.exe refusal list
 are unit-tested with a fake shim directory on every platform.
 
-## Scope / limits (v0.1.3)
+## Scope / limits (v0.2.0)
 
 - Claude Code `-p` (non-interactive) is the supported path. Interactive
   sessions and other agents (Codex, Cursor) are on the roadmap — the
@@ -554,8 +810,10 @@ are unit-tested with a fake shim directory on every platform.
   covered by tests that run on Windows too (the suite passed there on Python
   3.11 for 0.1.2), but they were developed on Linux: no file written by a real
   PowerShell 5 was read.
-- **What 0.1.3 was run on:** Linux only, Python 3.10 to 3.14 (and pytest on
-  3.11). Not on Windows or macOS, and not against a real `claude`. Agent names
+- **Hook mode and the spawn counter were never run by a real Claude Code,
+  and the culprit/forecast text was only seen on made-up streams.**
+- **What 0.2.0 was run on:** Linux only, Python 3.10, 3.13 and 3.14 and the
+  unpacked source archive. Not on Windows or macOS, and not against a real `claude`. Agent names
   in other letter cases are tested by name (and with a script really called
   `Claude` on POSIX), a Python without `sqlite3` is simulated, and the
   byte-order-mark and UTF-16 files are built byte by byte, not written by a

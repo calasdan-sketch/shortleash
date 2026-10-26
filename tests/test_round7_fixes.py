@@ -767,7 +767,7 @@ class TestTheReadmeTellsTheTruth(unittest.TestCase):
         with open(g.receipt_path, encoding="utf-8") as f:
             rec = json.load(f)
         self.assertEqual(rec["model"], "claude-haiku-4-5")
-        self.assertAlmostEqual(rec["cost_usd"], 0.80)  # haiku, not opus's 15
+        self.assertAlmostEqual(rec["cost_usd"], 1.00)  # haiku 4.5, not opus's 15
 
 
 class TestTheFleetExampleAndTtl(unittest.TestCase):

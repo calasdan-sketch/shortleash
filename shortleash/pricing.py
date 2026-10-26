@@ -29,6 +29,7 @@ matches nothing is priced with the "default" entry, and the receipt says so
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import json
 import math
 import os
@@ -37,19 +38,42 @@ from . import textfile
 
 #: Date the hard-coded table below was written. Nothing updates it
 #: automatically: when you change a number, change this too.
-PRICING_AS_OF = "2026-10-16"
+PRICING_AS_OF = "2026-10-24"
 
 #: Environment variable naming a pricing JSON file (used when --pricing
 #: is not given).
 PRICING_ENV = "SHORTLEASH_PRICING"
 
 # USD per 1M tokens. (input, output). Cache read ~10% of input, cache
-# write ~1.25x input — standard Anthropic cache pricing shape.
-# Fallback estimates as of PRICING_AS_OF — verify against provider pricing.
+# write ~1.25x input - the classic Anthropic cache pricing shape (a few
+# newest models charge less for cache reads; the estimate then runs high,
+# the safe side for a budget cap).
+# Source: https://platform.claude.com/docs/en/about-claude/pricing
+# (formerly docs.claude.com), read on PRICING_AS_OF. A bare family key
+# ("opus") is the CURRENT generation; older generations that cost more or
+# less have their own, longer keys, which win (longest match).
 DEFAULT_PRICING = {
-    "opus": (15.00, 75.00),
-    "sonnet": (3.00, 15.00),
-    "haiku": (0.80, 4.00),
+    "opus": (5.00, 25.00),         # Opus 4.5 / 4.6 / 4.7 / 4.8 / 5
+    "opus-5-5": (4.00, 20.00),
+    "opus-4-1": (15.00, 75.00),
+    "opus-4-2025": (15.00, 75.00),  # claude-opus-4-<date> (Opus 4)
+    "opus-4-0": (15.00, 75.00),
+    "opus-4": (15.00, 75.00),      # bare "claude-opus-4"
+    "opus-4-5": (5.00, 25.00),     # beat "opus-4" above
+    "opus-4-6": (5.00, 25.00),
+    "opus-4-7": (5.00, 25.00),
+    "opus-4-8": (5.00, 25.00),
+    "opus-5": (5.00, 25.00),
+    "3-opus": (15.00, 75.00),      # claude-3-opus
+    "sonnet": (3.00, 15.00),       # Sonnet 4 / 4.5 / 4.6 (and 3.x)
+    "sonnet-5": (2.00, 10.00),     # Sonnet 5 / 5.5
+    "haiku": (1.00, 5.00),         # Haiku 4.5
+    "haiku-3-5": (0.80, 4.00),
+    "3-5-haiku": (0.80, 4.00),
+    "haiku-5": (0.50, 2.50),       # Haiku 5.5: the >100k-prompt rate (the
+                                   # <=100k rate is 0.10 / 0.50); high = safe
+    "fable": (10.00, 50.00),
+    "mythos": (10.00, 50.00),
     "default": (3.00, 15.00),
 }
 
@@ -73,6 +97,28 @@ class PricingTable:
     def describe(self) -> str:
         return (f"{self.source} as of {self.as_of} "
                 f"— verify against provider pricing")
+
+
+#: A price table older than this many days gets a warning at start.
+STALE_AFTER_DAYS = 90
+
+
+def staleness(as_of: str, today=None) -> str | None:
+    """A warning line when the table is more than STALE_AFTER_DAYS old, or
+    its date cannot be read; None when it is fresh. ``today`` is a
+    datetime.date (tests pass one; no clock is read then)."""
+    try:
+        written = datetime.date.fromisoformat(str(as_of)[:10])
+    except ValueError:
+        return (f"the price table has no usable date ({as_of!r}): check the "
+                f"prices before trusting --budget")
+    today = today or datetime.date.today()
+    age = (today - written).days
+    if age > STALE_AFTER_DAYS:
+        return (f"the price table is {age} days old (written {written}): "
+                f"prices may have changed; check them, or give --pricing "
+                f"FILE with a current as_of")
+    return None
 
 
 def _parse_rates(data: dict, pricing: dict, where: str,

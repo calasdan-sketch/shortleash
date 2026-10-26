@@ -27,3 +27,39 @@ def history_path() -> str:
 
 def fleet_db_path() -> str:
     return os.path.join(state_dir(), "fleet.db")
+
+
+def private_dir(path: str) -> None:
+    """Create ``path`` (and missing parents) readable by this user only
+    (0700 on POSIX; Windows ignores the mode). A folder that already exists
+    is tightened when it is ours; one we cannot change is left alone."""
+    path = os.path.abspath(path)
+    missing = []
+    here = path
+    while not os.path.isdir(here) and os.path.dirname(here) != here:
+        missing.append(here)
+        here = os.path.dirname(here)
+    for d in reversed(missing):          # every folder we create is private
+        try:
+            os.mkdir(d, 0o700)
+        except FileExistsError:
+            pass
+    os.makedirs(path, exist_ok=True)     # raises if it is a file, etc.
+    if os.name == "posix":
+        try:
+            st = os.stat(path)
+            if st.st_uid == os.getuid() and st.st_mode & 0o077:
+                os.chmod(path, 0o700)
+        except OSError:
+            pass
+
+
+def append_private(path: str, data: bytes) -> None:
+    """Append ``data`` to ``path`` with ONE write (two processes appending
+    at once interleave whole records, never halves); the file is created
+    0600."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)

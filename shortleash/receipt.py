@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import stat
 from datetime import datetime, timezone
 
 from . import __version__
@@ -13,8 +14,31 @@ from . import __version__
 # Any argument whose NAME matches one of these (case-insensitive) gets its
 # VALUE replaced with *** in receipts. Matches --api-key, api_key=, -token,
 # --db-password value, etc.
-_SECRET_NAME_RE = re.compile(r"key|token|secret|password|passwd",
-                             re.IGNORECASE)
+# "auth" counts only as a whole word part (--auth, auth_header, x-auth-key,
+# oauth, authorization, authentication): "--author" is not a secret.
+_SECRET_NAME_RE = re.compile(
+    r"key|token|secret|password|passwd|bearer|credential|cookie"
+    r"|(?<![A-Za-z])o?auth(?:orization|entication)?(?![A-Za-z])",
+    re.IGNORECASE)
+#: Flags whose value is credentials although the name does not say so
+#: (curl -u user:pass, --proxy-user).
+_SECRET_VALUE_FLAGS = {"-u", "--user", "--proxy-user", "-U"}
+#: Flags whose value is an HTTP header line ("Authorization: Bearer ...").
+_HEADER_FLAGS = {"-H", "--header", "--proxy-header"}
+#: Secret-looking tokens inside ANY argument, wherever they appear:
+#: sk-... API keys, Bearer/Basic credentials, GitHub / Slack / AWS tokens.
+_SECRET_VALUE_RE = re.compile(
+    r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_\-]{8,}"
+    r"|(?<![A-Za-z0-9])(?i:bearer)\s+[A-Za-z0-9._~+/=\-]{8,}"
+    r"|(?<![A-Za-z0-9])(?i:basic)\s+(?=[A-Za-z0-9+/]*[A-Z0-9+/=])"
+    r"[A-Za-z0-9._~+/=\-]{8,}"
+    r"|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}")
+#: user:password@ inside a URL (https://user:pass@host/x).
+_URL_USERINFO_RE = re.compile(r"(?<=://)[^/\s:@]*:[^/\s@]*@")
+#: A short flag with its value glued on: curl -uuser:pass.
+_GLUED_USER_RE = re.compile(r"^(-[uU])(?!-)(.+:.*)$")
+_COLON_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_-]*):(?!//)(.+)$", re.DOTALL)
 _FLAG_EQ_RE = re.compile(r"^(--?)([A-Za-z0-9_][A-Za-z0-9_-]*)=(.*)$")
 _BARE_EQ_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_-]*)=(.*)$")
 _FLAG_RE = re.compile(r"^(--?)([A-Za-z0-9_][A-Za-z0-9_-]*)$")
@@ -29,7 +53,24 @@ def _is_secret_name(name: str) -> bool:
     return _SECRET_NAME_RE.search(name) is not None
 
 
+def _redact_header(text: str) -> str:
+    """`Authorization: Bearer x` -> `Authorization: ***` (name kept)."""
+    name, sep, _rest = text.partition(":")
+    if sep and (_is_secret_name(name) or name.strip().lower()
+                in ("proxy-authorization", "x-api-key")):
+        return f"{name}: ***"
+    return text
+
+
+def _scrub(arg: str) -> str:
+    return _URL_USERINFO_RE.sub("***@", _SECRET_VALUE_RE.sub("***", arg))
+
+
 def redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
+    return [_scrub(a) for a in _redact_argv(argv, redact_prompt)]
+
+
+def _redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
     """Return argv with secret values replaced by ***.
 
     Never mutate the original. Handles three shapes:
@@ -46,11 +87,24 @@ def redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
     """
     out: list[str] = []
     redact_next = False
+    header_next = False
     prompt_next = False
     for a in argv:
         if redact_next:
             out.append("***")
             redact_next = False
+            continue
+        if header_next:
+            out.append(_redact_header(a))
+            header_next = False
+            continue
+        if a in _HEADER_FLAGS:
+            out.append(a)
+            header_next = True
+            continue
+        if a in _SECRET_VALUE_FLAGS:
+            out.append(a)
+            redact_next = True
             continue
         if prompt_next:
             prompt_next = False
@@ -67,9 +121,17 @@ def redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
             if eq_flag:
                 out.append(f"{eq_flag}={REDACTED_PROMPT}")
                 continue
+        m = _GLUED_USER_RE.match(a)
+        if m:
+            out.append(m.group(1) + "***")
+            continue
         m = _FLAG_EQ_RE.match(a)
         if m:
             prefix, name, value = m.groups()
+            if prefix + name in _HEADER_FLAGS:
+                value = _redact_header(value)
+            elif prefix + name in _SECRET_VALUE_FLAGS:
+                value = "***"
             out.append(f"{prefix}{name}="
                        + ("***" if _is_secret_name(name) else value))
             continue
@@ -78,6 +140,10 @@ def redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
             name, value = m.groups()
             out.append(f"{name}="
                        + ("***" if _is_secret_name(name) else value))
+            continue
+        m = _COLON_RE.match(a)
+        if m and _is_secret_name(m.group(1)):
+            out.append(f"{m.group(1)}:***")
             continue
         m = _FLAG_RE.match(a)
         if m and _is_secret_name(m.group(2)):
@@ -134,6 +200,9 @@ def build_receipt(
     enforced_live: dict | None = None,
     breach_live: bool | None = None,
     price_assumed: bool = False,
+    culprit: dict | None = None,
+    agents: dict | None = None,
+    forecast: list | None = None,
 ) -> dict:
     warnings = list(warnings or [])
     if cost_usd is not None and not math.isfinite(cost_usd):
@@ -203,6 +272,16 @@ def build_receipt(
         # One line of advice printed under STOPPED (e.g. how to leave the
         # anomaly ratchet), or None.
         "hint": hint,
+        # Who used the tokens when subagents were started:
+        # {"text", "agent", "spawns", "agent_spawns", "token_share"}, else
+        # None. From the tokens each message reports and the agent type each
+        # spawn named; it is the agent's own report, not an audit.
+        "culprit": culprit,
+        # {agent: {"spawns", "tokens"}} for the busiest agents ("main" is
+        # the main conversation).
+        "agents": dict(agents or {}),
+        # The early-warning lines given during the run (see forecast.py).
+        "forecast": list(forecast or []),
     }
 
 
@@ -256,6 +335,9 @@ def format_human(receipt: dict) -> str:
         # run was over: nothing was stopped, and saying so would be a lie.
         verb = "EXCEEDED:" if receipt.get("breach_live") is False else "STOPPED: "
         lines.append(f"  {verb}  {receipt['breach_reason']}")
+        culprit = receipt.get("culprit")
+        if culprit and culprit.get("text"):
+            lines.append(f"  culprit:   {culprit['text']}")
         if receipt.get("hint"):
             lines.append(f"  hint:      {receipt['hint']}")
     elif receipt.get("agent_error"):
@@ -304,5 +386,12 @@ def prepare_receipt_path(path: str) -> None:
 
 
 def write_receipt(receipt: dict, path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+    # The command line (even redacted) and the session are private: 0600.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            os.chmod(path, 0o600)   # a file that already existed too
+    except OSError:
+        pass
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(_sanitize(receipt), f, indent=2, allow_nan=False)

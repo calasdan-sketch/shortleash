@@ -82,6 +82,34 @@ def _spawn_blocks(message: dict) -> list[str]:
     return ids
 
 
+#: Longest agent-type name kept (it comes from the agent's own output).
+MAX_AGENT_NAME = 60
+#: The name used for a spawn whose block names no type.
+UNKNOWN_AGENT = "agent"
+
+
+def _clean_name(value) -> str:
+    """A bounded, printable agent-type name from untrusted input."""
+    if not isinstance(value, str):
+        return UNKNOWN_AGENT
+    text = "".join(ch for ch in value if ch.isprintable()).strip()
+    return text[:MAX_AGENT_NAME] or UNKNOWN_AGENT
+
+
+def _spawn_types(message: dict) -> dict[str, str]:
+    """{tool_use id: agent type} for the subagent-spawning blocks of an
+    assistant message (`input.subagent_type`; the type is UNKNOWN_AGENT when
+    the block does not name one). Same ids as _spawn_blocks."""
+    types: dict[str, str] = {}
+    for i, block in enumerate((message or {}).get("content") or []):
+        if (isinstance(block, dict) and block.get("type") == "tool_use"
+                and block.get("name") in SPAWN_TOOL_NAMES):
+            args = block.get("input")
+            name = args.get("subagent_type") if isinstance(args, dict) else None
+            types[str(block.get("id") or f"<no-id>#{i}")] = _clean_name(name)
+    return types
+
+
 def _count_spawns(message: dict) -> int:
     """Count subagent spawns (`Agent`/`Task` tool_use blocks) in a message."""
     return len(_spawn_blocks(message))
@@ -118,6 +146,12 @@ def parse_line(line: str) -> dict | None:
             "usage_unreadable": unreadable_usage(message.get("usage")),
             "spawns": len(spawn_ids),
             "spawn_ids": spawn_ids,
+            # which agent type each spawn asked for, and which spawn (tool
+            # use id) this message was written under: None = the main
+            # conversation. Used to say who used the tokens.
+            "spawn_types": _spawn_types(message),
+            "parent_tool_use_id": (str(ev["parent_tool_use_id"])
+                                   if ev.get("parent_tool_use_id") else None),
         }
 
     if etype == "result":

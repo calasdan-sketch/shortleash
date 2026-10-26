@@ -58,7 +58,7 @@ def record(receipt: dict, path: str | None = None) -> None:
     tokens = sum(receipt.get("tokens", {}).values())
     if not _sane(cost, tokens):
         return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    paths.private_dir(os.path.dirname(path))
     entry = {
         "agent": receipt.get("agent", ""),
         "profile": receipt.get("profile", ""),
@@ -67,8 +67,8 @@ def record(receipt: dict, path: str | None = None) -> None:
         "breached": receipt.get("breached", False),
         "ended_at": receipt.get("ended_at", ""),
     }
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, allow_nan=False) + "\n")
+    paths.append_private(
+        path, (json.dumps(entry, allow_nan=False) + "\n").encode("utf-8"))
 
 
 def _key(entry: dict) -> str:
