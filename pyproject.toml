@@ -43,3 +43,6 @@ packages = ["shortleash"]
 
 [project.scripts]
 shortleash = "shortleash.cli:main"
+
+[tool.setuptools.package-data]
+shortleash = ["py.typed"]

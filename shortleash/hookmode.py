@@ -58,7 +58,7 @@ SPAWN_TOOLS = ("Agent", "Task")
 #: Most state lines read per session (a session with more is not plausible).
 MAX_LINES = 100_000
 #: State files older than this many days are removed by `hook status`.
-KEEP_DAYS = 14
+KEEP_DAYS = 7
 CAP_ENV = "SHORTLEASH_MAX_SPAWNS"
 SETTINGS_ENV = "CLAUDE_CONFIG_DIR"
 
@@ -332,7 +332,7 @@ def write_default_cap(cap: int | None) -> None:
         with contextlib.suppress(OSError):
             os.unlink(path)
         return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    paths.private_dir(os.path.dirname(path))
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"max_spawns": int(cap)}, f)
 
@@ -396,14 +396,12 @@ def session_file(session_id: str) -> str:
 
 
 def _append(path: str, record: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    paths.private_dir(os.path.dirname(path))     # 0700: session ids are here
     line = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-    fd = os.open(path, flags, 0o600)
-    try:
-        os.write(fd, line)      # one write: appends from two hooks interleave
-    finally:                    # whole lines, never halves
-        os.close(fd)
+    fresh = not os.path.exists(path)
+    paths.append_private(path, line)    # one write: whole lines, never halves
+    if fresh:
+        prune()         # a new session: drop state files older than KEEP_DAYS
 
 
 def read_state(path: str) -> list[dict]:

@@ -1,11 +1,13 @@
 # ShortLeash — stop runaway agents
 
-A circuit breaker for AI coding-agent runs — and a spawn-storm guard. Wraps an agent command, tails its
+**A seatbelt, not a sandbox.** A circuit breaker for AI coding-agent runs — and a spawn-storm guard. Wraps an agent command, tails its
 telemetry in real time, and **kills the run the moment it breaches a guardrail**
 — budget, subagent-spawn cap, token cap, or wall-clock timeout. Emits a
 per-run receipt showing what it cost and why it stopped. "The moment" needs
 an agent that streams its usage; an agent that only reports at the end can be
 checked, but no longer stopped (see *Live, or only afterwards*).
+
+**Limits:** It is a seatbelt, not a sandbox: it stops a run that crosses a limit, but it cannot stop an agent from doing harm inside the limits, and `kill -9` of the leash itself leaves the agent running on macOS.
 
 Vendors' "budgets" only warn while the meter keeps running. This one halts.
 
@@ -24,7 +26,7 @@ pip install git+https://github.com/calasdan-sketch/shortleash
 python3 -m shortleash run --budget 2.00 -- <command>
 ```
 
-Works on Linux, macOS and Windows 11 (Python 3.10+). On Windows, `claude`
+Written for Linux, macOS and Windows (Python 3.10+); the CI matrix runs the suite on those three systems. On Windows, `claude`
 is found through `PATHEXT` (the npm `claude.cmd` shim — see *Windows*
 below), and console output never dies on a cp1252 code page — unencodable
 characters are replaced.
@@ -142,6 +144,30 @@ What hook mode **cannot** do:
 - Anyone who can edit your Claude Code settings can remove it.
 - It has been checked against the documentation and with simulated hook
   input, never run by a real Claude Code (see the limits below).
+
+## `shortleash init` and `shortleash report`
+
+`shortleash init` is the one-command start: it installs the hook (the same
+idempotent install as `hook install`, with a limit of 10 subagent starts per
+session unless you already set one) and writes a starter `.shortleash.toml` in
+the current folder: `budget = 5.00`, `max_spawns = 10`, `timeout = 1800`
+(30 minutes). A profile that already exists is never overwritten. `--dry-run`
+changes nothing; `--scope`/`--settings` pick the settings file.
+
+The early-warning lines at 20%, 50% and 80% of a budget or token cap
+(`forecast`, on by default) are the soft warning: they go to stderr and never
+stop anything.
+
+`shortleash report [--days 7] [--json]` sums the history file
+(`~/.shortleash/history.jsonl`): runs, cost and tokens per agent/profile and
+per UTC day. It counts only what the history holds (runs with telemetry); the
+costs are the receipts' estimates or the agent-reported totals, not an invoice.
+
+State files (`~/.shortleash`, the hook's session files) are created readable by
+you only (0700 folders, 0600 files, POSIX); hook session files older than 7
+days are removed when a new session starts. When the built-in price table is
+more than 90 days old (or a `--pricing` file has no usable `as_of`) `run`
+prints a warning on stderr.
 
 ## Usage
 

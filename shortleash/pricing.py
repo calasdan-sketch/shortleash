@@ -29,6 +29,7 @@ matches nothing is priced with the "default" entry, and the receipt says so
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import json
 import math
 import os
@@ -96,6 +97,28 @@ class PricingTable:
     def describe(self) -> str:
         return (f"{self.source} as of {self.as_of} "
                 f"— verify against provider pricing")
+
+
+#: A price table older than this many days gets a warning at start.
+STALE_AFTER_DAYS = 90
+
+
+def staleness(as_of: str, today=None) -> str | None:
+    """A warning line when the table is more than STALE_AFTER_DAYS old, or
+    its date cannot be read; None when it is fresh. ``today`` is a
+    datetime.date (tests pass one; no clock is read then)."""
+    try:
+        written = datetime.date.fromisoformat(str(as_of)[:10])
+    except ValueError:
+        return (f"the price table has no usable date ({as_of!r}): check the "
+                f"prices before trusting --budget")
+    today = today or datetime.date.today()
+    age = (today - written).days
+    if age > STALE_AFTER_DAYS:
+        return (f"the price table is {age} days old (written {written}): "
+                f"prices may have changed; check them, or give --pricing "
+                f"FILE with a current as_of")
+    return None
 
 
 def _parse_rates(data: dict, pricing: dict, where: str,

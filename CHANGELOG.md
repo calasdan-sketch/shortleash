@@ -2,6 +2,10 @@
 
 ## 0.2.0
 
+- `shortleash init` (hook plus a starter `.shortleash.toml`: $5, 10 spawns, 30 minutes) and `shortleash report` (cost per agent and day from the history file).
+- State folders are created 0700 and history/hook files 0600; the history is appended with one write; hook session files older than 7 days are pruned when a session starts.
+- A warning when the built-in price table is more than 90 days old; a test that every price key resolves.
+- README opens with "a seatbelt, not a sandbox".
 - Spawn-storm guard: `--max-spawns` now explains itself. When it trips, the receipt says what to do and that the run stops quickly, not instantly.
 - The receipt names the culprit: `38 spawns, 71% of tokens in agent Explore` (new `culprit` and `agents` fields in the JSON receipt).
 - `.shortleash.toml`: per-repo limits (budget, max_spawns, max_tokens, timeout, forecast, profile). Flags win over the file. `--config`, `--no-config`.

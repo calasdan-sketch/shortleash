@@ -205,6 +205,20 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
     _add_run_parser(sub)
     _add_hook_parser(sub)
+    ini = sub.add_parser(
+        "init", help="One step: install the hook and write a starter "
+                     ".shortleash.toml ($5, 10 spawns, 30 minutes).")
+    ini.add_argument("--scope", choices=["user", "project", "local"],
+                     default="user")
+    ini.add_argument("--settings", metavar="FILE", default=None)
+    ini.add_argument("--dry-run", action="store_true",
+                     help="Say what would be done; change nothing.")
+    rep = sub.add_parser(
+        "report", help="Cost of guarded runs over the last N days, from "
+                       "the history file.")
+    rep.add_argument("--days", type=int, default=7, metavar="N")
+    rep.add_argument("--history-path", default=None, metavar="FILE")
+    rep.add_argument("--json", action="store_true")
     _add_fleet_parser(sub)
     _add_cache_parser(sub)
     return p
@@ -349,6 +363,59 @@ def _read_stdin() -> str:
         return sys.stdin.read(1024 * 1024)
     except (OSError, ValueError, AttributeError, UnicodeDecodeError):
         return ""
+
+
+def _cmd_report(args) -> int:
+    from . import costreport
+    if not 1 <= args.days <= 3650:
+        print("shortleash: error: --days must be between 1 and 3650",
+              file=sys.stderr)
+        return 2
+    r = costreport.summarize(args.history_path, args.days)
+    if args.json:
+        print(json.dumps(r, indent=2))
+    else:
+        for line in costreport.to_text(r):
+            print(line)
+    return 0
+
+
+def _cmd_init(args) -> int:
+    """Hook + starter profile in one step. Never overwrites a profile that
+    exists; the hook install is the same (idempotent) one as `hook install`."""
+    from . import costreport
+    target = os.path.join(os.getcwd(), profile_mod.FILE_NAME)
+    have = profile_mod.find()
+    cap, _ = hookmode.resolve_cap(os.getcwd())
+    plan = [f"hook: {hookmode.settings_path(args.scope) if not args.settings else args.settings}",
+            ("profile: " + (f"keeps {have}" if have else f"writes {target}"))]
+    if args.dry_run:
+        print("shortleash init (dry run), would do:")
+        for line in plan:
+            print("  " + line)
+        return 0
+    ns = argparse.Namespace(max_spawns=None if (have or cap is not None) else 10,
+                            scope=args.scope, settings=args.settings,
+                            dry_run=False)
+    rc = _cmd_hook(argparse.Namespace(hook_cmd="install", **vars(ns)))
+    if rc:
+        return rc
+    if have:
+        print(f"Kept the profile you already have: {have}")
+    else:
+        try:
+            with open(target, "x", encoding="utf-8", newline="\n") as f:
+                f.write(costreport.DEFAULT_PROFILE)
+            print(f"Wrote {target}: budget $5, 10 spawns, 30 minutes. "
+                  f"`shortleash run -- <agent>` enforces all three; the hook "
+                  f"enforces the spawn limit inside ordinary sessions.")
+        except FileExistsError:
+            print(f"Kept the profile you already have: {target}")
+        except OSError as e:
+            print(f"shortleash: error: cannot write {target}: "
+                  f"{e.strerror or e}", file=sys.stderr)
+            return 2
+    return 0
 
 
 def _hook_settings_file(args) -> str:
@@ -542,6 +609,10 @@ def main(argv: list[str] | None = None) -> int:
         return _print_command(_cmd_fleet, args)
     if args.cmd == "hook":
         return _print_command(_cmd_hook, args)
+    if args.cmd == "init":
+        return _print_command(_cmd_init, args)
+    if args.cmd == "report":
+        return _print_command(_cmd_report, args)
     if args.cmd == "run":
         merged = _apply_profile(args)
         if merged:
@@ -626,6 +697,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"{source}"
                 f"[shortleash] pricing: {pricing_table.describe()}\n"
             )
+            stale = pricing.staleness(pricing_table.as_of)
+            if stale:
+                _stderr_write(f"[shortleash] WARNING: {stale}\n")
         if args.fleet:
             return _run_with_fleet(g, cmd, args)
         return g.run(cmd)
