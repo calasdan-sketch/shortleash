@@ -5,28 +5,35 @@ command, the same file read, the same edit. Each repeat costs a full turn.
 This module spots that from the hook input, before the call runs.
 
     * Every tool call becomes a FINGERPRINT: the tool name plus a SHA-256 of
-      its canonical input (keys sorted, runs of white space collapsed, long
-      structures bounded). Only the fingerprint, the tool name, the
-      tool_use_id and a time are stored; never the input itself.
-    * A ring buffer of the last ``window`` calls of a session is kept in a
-      small private file next to the spawn-limit state.
-    * ``warn`` identical calls inside that window: the call is ALLOWED and
-      Claude is told (additionalContext) and so is the user (systemMessage).
-      No permissionDecision is sent for a warning, because "allow" would also
-      skip the user's permission prompt.
-    * ``deny`` identical calls inside the window: permissionDecision "deny"
-      with a reason Claude reads. 0 switches a level off.
+      its whole input (keys sorted, hashed piece by piece, nothing cut off).
+      White space is collapsed only in a Bash command, where it does not
+      change the meaning; every other tool's input is compared exactly (an
+      edit that differs by indentation is a different edit).
+    * Only the fingerprint, the tool name, the tool_use_id and a time are
+      stored, never the input. One small append-only file per session.
+    * Default metric, "consecutive": the same call N times IN A ROW. A
+      different call in between starts the count again, so an ordinary
+      edit / test / edit / test cycle is never counted. The optional
+      "window" metric counts identical calls among the last W calls.
+    * Warning (default 6 in a row): the call is ALLOWED and Claude and the
+      user are told. No permissionDecision is sent for a warning, because
+      "allow" would also skip the user's permission prompt.
+    * Refusal is OFF unless you set it (--loop-deny N, at least 12 unless you
+      force a lower number): permissionDecision "deny" with a reason Claude
+      reads. A refused call is not recorded, so one different call in between
+      ends the refusal at once.
     * Optional: if ``velocity_usd_per_min`` is set and the session
       transcript is readable, the estimated cost of the last five minutes is
       compared with it, and a warning (never a denial) is sent at most once
       every ten minutes.
 
-What it does not do, plainly: it sees identical calls, not merely similar
-ones (a loop that changes one character each time is not caught); it
-cannot take back tokens already spent; the velocity figure is an estimate
-from the price table and the transcript, which is a file Claude Code does
-not document; and, like the rest of hook mode, it fails OPEN: any problem
-is an allow. It counts per session_id.
+What it does not do, plainly: it sees identical calls, not similar ones; it
+cannot tell a loop from legitimate polling or a test that is re-run after an
+edit elsewhere (it has no PostToolUse, so it never sees results), which is why
+refusing is opt-in; it cannot take back tokens already spent; the velocity
+figure is an estimate from the price table and the transcript, which is a file
+Claude Code does not document; and, like the rest of hook mode, it fails OPEN:
+any problem is an allow. It counts per session_id.
 """
 
 from __future__ import annotations
@@ -42,18 +49,24 @@ from . import paths
 
 #: Defaults: conservative. Warn at the 4th identical call among the last 20,
 #: deny at the 8th.
-DEFAULT_WARN = 4
-DEFAULT_DENY = 8
+DEFAULT_WARN = 6                  # consecutive mode
+DEFAULT_WARN_WINDOW = 4           # window mode
+DEFAULT_DENY = 0                  # refusing is opt-in
 DEFAULT_WINDOW = 20
+MIN_DENY = 12                     # lowest --loop-deny without --force-low
+MODES = ("consecutive", "window")
+DEFAULT_MODE = "consecutive"
 #: Calls older than this are not part of the window (a session picked up
 #: again after a break does not inherit yesterday's repeats).
 MAX_AGE_SECONDS = 3600
-#: The most lines ever read from a ring-buffer file.
-MAX_LINES = 5000
-#: Canonical-input bounds: nothing here may grow without limit.
+#: Only the end of a ring-buffer file is read (it is append-only).
+TAIL_BYTES = 256 * 1024
+#: A file bigger than this stops growing (the guard then sees nothing new).
+MAX_FILE_BYTES = 16 * 1024 * 1024
+#: Nesting deeper than this is hashed as a marker.
 MAX_DEPTH = 24
-MAX_ITEMS = 500
-MAX_STRING = 200_000
+#: Strings are fed to the hash in pieces of this many characters.
+CHUNK = 65536
 
 VELOCITY_WINDOW_SECONDS = 300
 VELOCITY_REWARN_SECONDS = 600
@@ -64,6 +77,7 @@ ENV_WARN = "SHORTLEASH_LOOP_WARN"
 ENV_DENY = "SHORTLEASH_LOOP_DENY"
 ENV_WINDOW = "SHORTLEASH_LOOP_WINDOW"
 ENV_VELOCITY = "SHORTLEASH_VELOCITY_USD_PER_MIN"
+ENV_MODE = "SHORTLEASH_LOOP_MODE"
 ENV_OFF = "SHORTLEASH_LOOP_GUARD"          # "off" / "0" / "false" disables
 
 
@@ -72,35 +86,55 @@ ENV_OFF = "SHORTLEASH_LOOP_GUARD"          # "off" / "0" / "false" disables
 # ---------------------------------------------------------------------------
 
 _WS = re.compile(r"\s+")
+#: Tools whose "command" is shell text, where white space has no meaning
+#: between words. Nothing else is normalised.
+SHELL_TOOLS = ("Bash", "PowerShell")
 
 
-def _norm(value, depth=0):
+def _feed(h, value, depth, collapse):
     if depth > MAX_DEPTH:
-        return "<deep>"
+        h.update(b"<deep>")
+        return
     if isinstance(value, str):
-        return _WS.sub(" ", value[:MAX_STRING]).strip()
-    if isinstance(value, bool) or value is None:
-        return value
-    if isinstance(value, (int, float)):
-        return value if value == value else "nan"
-    if isinstance(value, dict):
-        out = {}
-        for i, key in enumerate(sorted(value, key=str)):
-            if i >= MAX_ITEMS:
-                break
-            out[str(key)] = _norm(value[key], depth + 1)
-        return out
-    if isinstance(value, (list, tuple)):
-        return [_norm(v, depth + 1) for v in list(value)[:MAX_ITEMS]]
-    return str(type(value).__name__)
+        if collapse:
+            value = _WS.sub(" ", value).strip()
+        h.update(b"s%d:" % len(value))
+        for i in range(0, len(value), CHUNK):
+            h.update(value[i:i + CHUNK].encode("utf-8", "surrogatepass"))
+    elif isinstance(value, bool):
+        h.update(b"T" if value else b"F")
+    elif value is None:
+        h.update(b"N")
+    elif isinstance(value, (int, float)):
+        h.update(b"n" + repr(value).encode("ascii") + b";")
+    elif isinstance(value, dict):
+        h.update(b"{%d:" % len(value))
+        for key in sorted(value, key=str):
+            _feed(h, str(key), depth + 1, False)
+            _feed(h, value[key], depth + 1, False)
+        h.update(b"}")
+    elif isinstance(value, (list, tuple)):
+        h.update(b"[%d:" % len(value))
+        for item in value:
+            _feed(h, item, depth + 1, False)
+        h.update(b"]")
+    else:
+        h.update(b"?" + type(value).__name__.encode("ascii", "replace"))
 
 
 def fingerprint(tool_name: str, tool_input) -> str:
-    """tool name + first 16 hex digits of SHA-256 of the canonical input."""
-    text = json.dumps(_norm(tool_input), sort_keys=True,
-                      separators=(",", ":"), ensure_ascii=True)
-    digest = hashlib.sha256(text.encode("ascii")).hexdigest()[:16]
-    return f"{tool_name[:60]}:{digest}"
+    """tool name + first 16 hex digits of SHA-256 over the whole input.
+    White space is collapsed only in a shell tool's ``command``."""
+    h = hashlib.sha256()
+    if tool_name in SHELL_TOOLS and isinstance(tool_input, dict):
+        h.update(b"{%d:" % len(tool_input))
+        for key in sorted(tool_input, key=str):
+            _feed(h, str(key), 1, False)
+            _feed(h, tool_input[key], 1, key == "command")
+        h.update(b"}")
+    else:
+        _feed(h, tool_input, 0, False)
+    return f"{tool_name[:60]}:{h.hexdigest()[:16]}"
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +180,9 @@ def settings_from(raw: dict | None) -> dict:
     value = _positive(raw.get("velocity"))
     if value is not None:
         out["velocity"] = value
+    mode = raw.get("mode")
+    if isinstance(mode, str) and mode.strip().lower() in MODES:
+        out["mode"] = mode.strip().lower()
     return out
 
 
@@ -158,7 +195,8 @@ def from_environ(environ) -> dict | None:
     got = settings_from({"warn": environ.get(ENV_WARN),
                          "deny": environ.get(ENV_DENY),
                          "window": environ.get(ENV_WINDOW),
-                         "velocity": environ.get(ENV_VELOCITY)})
+                         "velocity": environ.get(ENV_VELOCITY),
+                         "mode": environ.get(ENV_MODE)})
     return got or None
 
 
@@ -179,7 +217,10 @@ def finish(sources: list) -> dict | None:
             merged.setdefault(key, value)
     if not asked:
         return None
-    cfg = {"warn": merged.get("warn", DEFAULT_WARN),
+    mode = merged.get("mode", DEFAULT_MODE)
+    cfg = {"mode": mode,
+           "warn": merged.get("warn", DEFAULT_WARN if mode == "consecutive"
+                              else DEFAULT_WARN_WINDOW),
            "deny": merged.get("deny", DEFAULT_DENY),
            "window": merged.get("window", DEFAULT_WINDOW),
            "velocity": merged.get("velocity")}
@@ -200,70 +241,70 @@ def problems(cfg: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# The ring buffer
+# The call log: append-only, only the end of it is read
 # ---------------------------------------------------------------------------
 
 def _read(path: str) -> list[dict]:
     rows: list[dict] = []
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for i, line in enumerate(f):
-                if i >= MAX_LINES:
-                    break
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(row, dict):
-                    rows.append(row)
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(0, size - TAIL_BYTES)
+            f.seek(start)
+            data = f.read(TAIL_BYTES)
     except OSError:
-        pass
+        return rows
+    if start:
+        data = data.split(b"\n", 1)[-1]          # the first line is cut
+    for line in data.decode("utf-8", "replace").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
     return rows
 
 
-def _rewrite(path: str, rows: list[dict]) -> None:
-    """Replace the file with ``rows`` (atomic, still 0600)."""
-    tmp = f"{path}.{os.getpid()}.tmp"
-    data = "".join(json.dumps(r, separators=(",", ":")) + "\n"
-                   for r in rows).encode("utf-8")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        os.write(fd, data)
-    finally:
-        os.close(fd)
-    try:
-        os.replace(tmp, path)
-    except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-
-
-def record_and_count(path: str, fp: str, tool: str, use_id: str,
-                     window: int, now: float | None = None) -> int:
-    """Add one call to the session's ring buffer and return how many of the
-    last ``window`` calls (this one included, and only calls from the last
-    hour) have the same fingerprint. A tool_use_id seen before (Claude Code
-    retrying one call) is not counted twice."""
+def count_for(path: str, fp: str, tool: str, use_id: str, cfg: dict,
+              now: float | None = None) -> tuple[int, str]:
+    """(how many identical calls this one makes, "deny" | "warn" | "ok").
+    The call is recorded unless it is refused: a refused call leaves no
+    trace, so one different call in between ends the refusal at once. A
+    tool_use_id seen before (Claude Code retrying one call) is not counted
+    twice. Append-only (one write per call), so two calls made at the same
+    moment cannot lose each other's line."""
     now = time.time() if now is None else now
     paths.private_dir(os.path.dirname(path))
     rows = [r for r in _read(path)
             if isinstance(r.get("ts"), (int, float))
             and now - r["ts"] <= MAX_AGE_SECONDS and "fp" in r]
-    seen = bool(use_id) and any(
-        r.get("id") == use_id for r in rows)
+    seen = bool(use_id) and any(r.get("id") == use_id for r in rows)
+    seq = [r.get("fp") for r in rows]
     if not seen:
+        seq.append(fp)
+    if cfg.get("mode") == "window":
+        count = sum(1 for x in seq[-cfg["window"]:] if x == fp)
+    else:
+        count = 0
+        for x in reversed(seq[-cfg["window"]:]):
+            if x != fp:
+                break
+            count += 1
+    verdict = level(count, cfg)
+    if verdict != "deny" and not seen:
+        try:
+            if os.path.getsize(path) > MAX_FILE_BYTES:
+                return count, verdict
+        except OSError:
+            pass
         row = {"fp": fp, "tool": tool[:40], "ts": round(now, 3)}
         if use_id:
             row["id"] = use_id[:80]
         paths.append_private(path, (json.dumps(
             row, separators=(",", ":")) + "\n").encode("utf-8"))
-        rows.append(row)
-        if len(rows) > window * 4 + 16:
-            _rewrite(path, rows[-window:])
-    recent = rows[-window:]
-    return sum(1 for r in recent if r.get("fp") == fp)
+    return count, verdict
 
 
 def level(count: int, cfg: dict) -> str:
@@ -275,22 +316,28 @@ def level(count: int, cfg: dict) -> str:
     return "ok"
 
 
+def _how_many(count: int, tool: str, cfg: dict) -> str:
+    if cfg.get("mode") == "window":
+        return (f"the {count}th identical {tool} call among your last "
+                f"{cfg['window']} tool calls")
+    return f"the {count}th identical {tool} call in a row"
+
+
 def warn_text(count: int, tool: str, cfg: dict) -> str:
     deny = (f" It will be refused at {cfg['deny']}." if cfg["deny"] else "")
-    return (f"shortleash loop guard: this is the {count}th identical "
-            f"{tool} call among your last {cfg['window']} tool calls.{deny} "
-            f"If it keeps giving the same result, stop repeating it: read "
-            f"the result, change the approach, or stop and tell the user "
-            f"what is blocking you.")
+    return (f"shortleash loop guard: this is {_how_many(count, tool, cfg)}."
+            f"{deny} If it keeps giving the same result, stop repeating it: "
+            f"read the result, change the approach, or stop and tell the "
+            f"user what is blocking you. (If you are legitimately waiting "
+            f"or re-running a test after a change, carry on.)")
 
 
 def deny_text(count: int, tool: str, cfg: dict) -> str:
-    return (f"shortleash loop guard: this identical {tool} call has now "
-            f"been made {count} times among your last {cfg['window']} "
-            f"tool calls, which is the limit. It was not run. Do something "
-            f"different (change the command, fix the cause of the error), "
-            f"or stop and report to the user what is blocking you. The "
-            f"limit was set by the user.")
+    return (f"shortleash loop guard: this is {_how_many(count, tool, cfg)}, "
+            f"which is the limit. It was not run. Do something different "
+            f"(change the command, fix the cause of the error) and you can "
+            f"come back to this call, or stop and report to the user what is "
+            f"blocking you. The limit was set by the user.")
 
 
 # ---------------------------------------------------------------------------

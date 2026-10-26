@@ -149,46 +149,78 @@ What hook mode **cannot** do:
 
 A stuck agent often repeats one tool call: the same failing command, the same
 read. Each repeat costs a whole turn. With the guard on, the PreToolUse hook
-runs for every tool (matcher `*`) and keeps, per session, a small ring buffer
-of **fingerprints**: the tool name plus a SHA-256 of its input with keys
-sorted and white space collapsed. Only the fingerprint, the tool name, the
-`tool_use_id` and a time are stored, never the input. The file is
-`~/.shortleash/hooks/<session>.loop` (0600, folder 0700) and is pruned after 7
-days like the other state.
+runs for every tool (matcher `*`) and keeps, per session, a small append-only
+log of **fingerprints**: the tool name plus a SHA-256 of the whole tool input
+(keys sorted; white space is collapsed **only** in a Bash/PowerShell `command`,
+every other input, an edit for instance, is compared exactly). Only the
+fingerprint, the tool name, the `tool_use_id` and a time are stored, never the
+input. The file is `~/.shortleash/hooks/<session>.loop` (0600, folder 0700) and
+is pruned after 7 days.
 
 ```bash
-shortleash hook install --loop-guard                       # warn at 4, refuse at 8, among the last 20
-shortleash hook install --loop-warn 3 --loop-deny 6 --loop-window 12
-shortleash hook install --velocity-usd-per-min 1.5         # optional spend warning
-shortleash hook install --no-loop-guard                    # off again (matcher back to Agent|Task)
+shortleash hook install --loop-guard                  # warn at the 6th identical call IN A ROW; refuses nothing
+shortleash hook install --loop-warn 8 --loop-deny 15 # also refuse at 15 in a row (12 or more)
+shortleash hook install --loop-deny 8 --force-low     # lower than 12 only on purpose
+shortleash hook install --loop-mode window --loop-window 20 --loop-warn 4
+shortleash hook install --velocity-usd-per-min 1.5    # optional spend warning
+shortleash hook install --no-loop-guard               # off again (matcher back to Agent|Task)
 ```
 
-- **Warn** (`loop_warn`, default 4): the call is allowed. Claude gets an
-  `additionalContext` note and you get a `systemMessage`. No
-  `permissionDecision` is sent, because `"allow"` would also skip your
-  permission prompt.
-- **Refuse** (`loop_deny`, default 8): `permissionDecision: "deny"` with a
-  reason Claude reads. The refused calls stay in the window, so the loop has
-  to be broken, not just retried; once the identical calls slide out of the
-  last `loop_window` calls (or are an hour old) the tool works again.
-- `0` switches a level off. Settings come, per key, from `$SHORTLEASH_LOOP_WARN`,
-  `_DENY`, `_WINDOW`, `$SHORTLEASH_VELOCITY_USD_PER_MIN` (and
-  `$SHORTLEASH_LOOP_GUARD=off`), then `[hook]` in `.shortleash.toml`
-  (`loop_warn`, `loop_deny`, `loop_window`, `velocity_usd_per_min`), then what
-  `install` saved. Nothing set = the guard is off.
+- **Consecutive (the default metric):** the same call N times *in a row*. A
+  different call in between starts the count again, so the ordinary
+  edit / test / edit / test cycle is never counted. **Window mode** (optional)
+  counts identical calls among the last `loop_window` (20) calls.
+- **Warn** (`loop_warn`, default 6 in a row; 4 in window mode): the call is
+  allowed. Claude gets an `additionalContext` note and you get a
+  `systemMessage`. No `permissionDecision` is sent, because `"allow"` would also
+  skip your permission prompt.
+- **Refuse is off by default.** Set `loop_deny` (at least 12 unless you pass
+  `--force-low`) and the call is answered `permissionDecision: "deny"` with a
+  reason Claude reads. A refused call is **not recorded**, so one different call
+  in between ends the refusal at once.
+- **False positives you should expect.** The hook sees calls, never their
+  results (there is no PostToolUse). Re-running the same test command with
+  nothing changed in between, polling a status command (`git status`, a `curl`
+  to a status page) and re-reading one file all look like a loop. That is why
+  it warns by default and only refuses if you ask. Warnings are advice to Claude
+  ("if you are legitimately waiting, carry on").
+- Settings come, per key, from `$SHORTLEASH_LOOP_WARN`, `_DENY`, `_WINDOW`,
+  `_MODE`, `$SHORTLEASH_VELOCITY_USD_PER_MIN` (and `$SHORTLEASH_LOOP_GUARD=off`),
+  then `[hook]` in `.shortleash.toml` (`loop_warn`, `loop_deny`, `loop_window`,
+  `loop_mode`, `velocity_usd_per_min`), then what `install` saved. Nothing set =
+  the guard is off. **A project file is not trusted to make the guard refuse
+  early:** a cloned repository's `.shortleash.toml` with `loop_deny` below 12 is
+  ignored (an environment variable or the install can set a lower number). It
+  can still turn the guard on and make it warn, or set `loop_warn = 1` to make
+  every call carry a warning (a nuisance, not a block).
 - **Spend velocity** (off unless a limit is set): the hook reads the last
-  megabyte of the session transcript (`transcript_path`), prices the
-  assistant messages of the last five minutes with shortleash's price table
-  and warns (never refuses) above your limit, at most once in ten minutes. It
-  is an estimate from a file Claude Code does not document; with no readable
-  data it says nothing. For money you can enforce, use `shortleash run`.
+  megabyte of the session transcript (`transcript_path`), prices the assistant
+  messages of the last five minutes with shortleash's price table and warns
+  (never refuses) above your limit, at most once in ten minutes. It is an
+  estimate from a file Claude Code does not document; with no readable data it
+  says nothing. For money you can enforce, use `shortleash run`.
 
-What it does not do: it catches **identical** calls, not near-identical ones
-(a loop that changes one character each time is not seen); it cannot take back
-tokens already spent; it starts a process for every tool call (a few tens of
-milliseconds); and it **fails open** like the rest of hook mode: any problem,
-an unwritable folder, a corrupt file, is an allow. A parallel batch of calls
-may be counted one call late.
+**The cost of `*`.** The matcher `*` starts one Python process for every tool
+call. Measured on a Linux container (median of 30 calls, `python -I`, a bare
+interpreter alone took about 11 ms): **about 52 ms per tool call on Python
+3.10, 58 ms on 3.12 and 66 ms on 3.14**, nearly all of it importing shortleash.
+Your machine, and especially Windows with antivirus, will differ; the hook has a
+10 second timeout and fails open.
+
+**The shared-group limit.** Install changes the matcher to `*` only on a group
+that holds nothing but shortleash's own hook. If a hook of yours shares the
+`Agent|Task` group, the matcher is left alone and the guard would silently see
+only subagent calls. `hook install --loop-guard` now prints a warning in that
+case and `hook status` warns as long as it is true; move your hook to its own
+group and install again. `hook uninstall` removes the saved guard settings once
+no settings file has the hook any more.
+
+What it does not do: it catches **identical** calls, not near-identical ones (a
+loop that changes one character each time is not seen); it cannot take back
+tokens already spent; and it **fails open** like the rest of hook mode: any
+problem, an unwritable folder, a corrupt file, is an allow. Parallel calls are
+each appended with one write, so none is lost, but two calls made at the same
+instant may each count the other one late.
 
 ## `shortleash init` and `shortleash report`
 

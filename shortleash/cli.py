@@ -156,20 +156,28 @@ def _add_hook_parser(sub) -> None:
                           "SPAWNS or a .shortleash.toml.")
     ins.add_argument("--loop-guard", action="store_true",
                      help="Also watch for a repeated tool call: warn at the "
-                          "4th identical call among the last 20 and refuse "
-                          "at the 8th. Makes the PreToolUse hook run for "
-                          "every tool.")
+                          "6th identical call in a row (nothing is refused "
+                          "unless --loop-deny is given). Makes the "
+                          "PreToolUse hook run for every tool.")
     ins.add_argument("--no-loop-guard", action="store_true",
                      help="Switch the repeat-call guard off again.")
     ins.add_argument("--loop-warn", type=int, default=None, metavar="N",
-                     help="Warn at N identical calls (default 4; 0 = never). "
-                          "Implies --loop-guard.")
+                     help="Warn at N identical calls in a row (default 6; "
+                          "0 = never). Implies --loop-guard.")
     ins.add_argument("--loop-deny", type=int, default=None, metavar="M",
-                     help="Refuse at M identical calls (default 8; 0 = "
-                          "never). Implies --loop-guard.")
+                     help="Refuse at M identical calls (off unless given; "
+                          "at least 12 unless --force-low). Implies "
+                          "--loop-guard.")
+    ins.add_argument("--force-low", action="store_true",
+                     help="Allow --loop-deny below 12.")
+    ins.add_argument("--loop-mode", choices=["consecutive", "window"],
+                     default=None,
+                     help="consecutive: the same call N times in a row "
+                          "(default); window: N identical calls among the "
+                          "last W calls.")
     ins.add_argument("--loop-window", type=int, default=None, metavar="W",
-                     help="Count among the last W tool calls (default 20). "
-                          "Implies --loop-guard.")
+                     help="For --loop-mode window: count among the last W "
+                          "tool calls (default 20). Implies --loop-guard.")
     ins.add_argument("--velocity-usd-per-min", type=float, default=None,
                      metavar="USD", help="Warn when the session's estimated "
                      "spend over the last five minutes exceeds USD per "
@@ -509,13 +517,16 @@ def _hook_install(args) -> int:
           "(`shortleash hook status`)")
     if loop_flag is True:
         c = loopguard_mod.finish([loop_cfg])
-        print(f"  Repeat-call guard (PreToolUse on every tool): warn at "
-              f"{c['warn'] or 'never'}, refuse at {c['deny'] or 'never'} "
-              f"identical calls among the last {c['window']}"
-              + (f"; velocity warning above ${c['velocity']:g}/min"
-                 if c.get("velocity") else ""))
+        print(f"  Repeat-call guard (PreToolUse on every tool): "
+              + _loop_summary(c))
         print("    It fails open, sees identical calls only, and runs a "
               "process for every tool call.")
+        if hookmode.loop_sees_all_tools(path) is False:
+            print("shortleash: warning: your PreToolUse entry for shortleash "
+                  "shares a matcher group with a hook of your own, so its "
+                  "matcher was left as it is and the repeat-call guard will "
+                  "NOT see most tools. Move your hook to its own group, then "
+                  "run `hook install --loop-guard` again.", file=sys.stderr)
     cap, where = hookmode.resolve_cap(os.getcwd())
     if cap is None:
         print("No limit is set yet, so nothing is refused: pass "
@@ -529,13 +540,25 @@ def _hook_install(args) -> int:
     return 0
 
 
+def _loop_summary(c: dict) -> str:
+    if c["mode"] == "window":
+        what = f"identical calls among the last {c['window']}"
+    else:
+        what = "identical calls in a row"
+    return (f"warn at {c['warn'] or 'never'}, refuse at "
+            f"{c['deny'] or 'never'} {what}"
+            + (f"; velocity above ${c['velocity']:g}/min"
+               if c.get("velocity") else ""))
+
+
 def _loop_args(args):
     """(settings dict for the guard or None, True/False/None = on/off/leave,
     problem text or "")."""
     get = lambda name: getattr(args, name, None)  # noqa: E731 - init has none
     given = {"warn": get("loop_warn"), "deny": get("loop_deny"),
              "window": get("loop_window"),
-             "velocity": get("velocity_usd_per_min")}
+             "velocity": get("velocity_usd_per_min"),
+             "mode": get("loop_mode")}
     for name, value in (("--loop-warn", given["warn"]),
                         ("--loop-deny", given["deny"]),
                         ("--loop-window", given["window"])):
@@ -543,6 +566,13 @@ def _loop_args(args):
             return None, None, f"{name} must be >= 0"
     if given["velocity"] is not None and not (given["velocity"] > 0):
         return None, None, "--velocity-usd-per-min must be greater than 0"
+    if given["deny"] and given["deny"] < loopguard_mod.MIN_DENY \
+            and not get("force_low"):
+        return None, None, (
+            f"--loop-deny {given['deny']} is below {loopguard_mod.MIN_DENY}: "
+            f"a normal test re-run or polling loop would be refused. Use "
+            f"{loopguard_mod.MIN_DENY} or more, or add --force-low if you "
+            f"mean it")
     if get("no_loop_guard"):
         if get("loop_guard") or any(v is not None for v in given.values()):
             return None, None, ("--no-loop-guard cannot be combined with "
@@ -551,11 +581,11 @@ def _loop_args(args):
     if not (get("loop_guard") or any(v is not None for v in given.values())):
         return None, None, ""
     cfg = {k: v for k, v in given.items() if v is not None}
-    full = loopguard_mod.finish([cfg or {"warn": loopguard_mod.DEFAULT_WARN}])
+    full = loopguard_mod.finish([cfg or {"mode": loopguard_mod.DEFAULT_MODE}])
     why = loopguard_mod.problems(full)
     if why:
         return None, None, why[0]
-    return cfg or {"warn": loopguard_mod.DEFAULT_WARN}, True, ""
+    return cfg or {"mode": loopguard_mod.DEFAULT_MODE}, True, ""
 
 
 def _hook_uninstall(args) -> int:
@@ -570,6 +600,12 @@ def _hook_uninstall(args) -> int:
     hookmode.update_settings(path, change)
     print(f"Removed {count[0]} shortleash hook(s) from {path}; "
           f"every other setting was left as it was.")
+    # The saved repeat-call settings go too, once no settings file has our
+    # hook any more (hook.json is shared by every scope).
+    if not any(hookmode.installed_in(hookmode.settings_path(sc))
+               for sc in ("user", "project", "local")) \
+            and not (args.settings and hookmode.installed_in(args.settings)):
+        hookmode.write_loop_config(None)
     return 0
 
 
@@ -584,11 +620,13 @@ def _hook_status() -> int:
     print("limit:   " + (f"{cap} per session (from {where})" if cap is not None
                          else "none set (nothing is refused)"))
     lc = hookmode.resolve_loop(os.getcwd())
-    print("repeat-call guard: " + (
-        f"warn at {lc['warn'] or 'never'}, refuse at {lc['deny'] or 'never'} "
-        f"identical calls among the last {lc['window']}"
-        + (f"; velocity above ${lc['velocity']:g}/min" if lc["velocity"]
-           else "") if lc else "off"))
+    print("repeat-call guard: " + (_loop_summary(lc) if lc else "off"))
+    if lc:
+        for scope, path in mine:
+            if hookmode.loop_sees_all_tools(path) is False:
+                print(f"  WARNING: {scope} ({path}): the hook's matcher is "
+                      f"not '*', so the guard cannot see all tools (a hook "
+                      f"of yours probably shares its group)")
     rows = hookmode.sessions()
     if not rows:
         print("no sessions counted yet")

@@ -394,7 +394,7 @@ def resolve_loop(cwd: str | None, environ=None) -> dict | None:
     the first found wins: the environment ($SHORTLEASH_LOOP_WARN, _DENY,
     _WINDOW, $SHORTLEASH_VELOCITY_USD_PER_MIN; $SHORTLEASH_LOOP_GUARD=off
     switches it off), the nearest .shortleash.toml ([hook] loop_warn,
-    loop_deny, loop_window, velocity_usd_per_min), what `hook install
+    loop_deny (12 or more only), loop_window, loop_mode, velocity_usd_per_min), what `hook install
     --loop-guard` saved. No source at all = off."""
     env = os.environ if environ is None else environ
     from_env = loopguard.from_environ(env)
@@ -408,7 +408,14 @@ def resolve_loop(cwd: str | None, environ=None) -> dict | None:
         from_toml = loopguard.settings_from({
             "warn": hook.get("loop_warn"), "deny": hook.get("loop_deny"),
             "window": hook.get("loop_window"),
-            "velocity": hook.get("velocity_usd_per_min")}) or None
+            "velocity": hook.get("velocity_usd_per_min"),
+            "mode": hook.get("loop_mode")}) or None
+        # A project file is not trusted to make the guard refuse calls: a
+        # cloned repository could set loop_deny = 1. Refusing from a file
+        # needs at least MIN_DENY; lower needs the environment or the install.
+        if from_toml and from_toml.get("deny", loopguard.MIN_DENY) \
+                < loopguard.MIN_DENY:
+            del from_toml["deny"]
     saved = loopguard.settings_from(_read_hook_config().get("loop")) or None
     return loopguard.finish([from_env, from_toml, saved])
 
@@ -544,10 +551,9 @@ def _loop_verdict(event: dict, session: str, cwd, environ) -> tuple[str, list[st
         path = loop_file(session)
         now = time.time()
         fp = loopguard.fingerprint(tool, event.get("tool_input"))
-        count = loopguard.record_and_count(
+        count, verdict = loopguard.count_for(
             path, fp, tool, use_id if isinstance(use_id, str) else "",
-            cfg["window"], now)
-        verdict = loopguard.level(count, cfg)
+            cfg, now)
         if verdict == "deny":
             return "deny", [loopguard.deny_text(count, tool, cfg)]
         messages = []
@@ -681,6 +687,24 @@ def prune(days: int = KEEP_DAYS) -> int:
         except OSError:
             pass
     return removed
+
+
+def loop_sees_all_tools(path: str) -> bool | None:
+    """Does our PreToolUse hook in the settings file at ``path`` run for every
+    tool (matcher "*", "" or absent)? None = it is not installed there."""
+    try:
+        with open(path, "rb") as f:
+            settings = _parse_settings(f.read(), path)
+    except (OSError, HookError):
+        return None
+    hooks = settings.get("hooks")
+    groups = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+    for group in groups if isinstance(groups, list) else []:
+        if isinstance(group, dict) and any(
+                isinstance(h, dict) and is_ours("PreToolUse", h.get("command"))
+                for h in group.get("hooks") or []):
+            return group.get("matcher") in (None, "", "*")
+    return None
 
 
 def installed_in(path: str) -> list[str]:

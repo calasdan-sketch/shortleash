@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Repeat-call guard for hook mode (`shortleash hook install --loop-guard`): a per-session ring buffer of tool-call fingerprints (tool name + hash of the canonical input; the input itself is never stored) warns at the 4th identical call among the last 20 and refuses at the 8th; levels, window and an optional spend-velocity warning are settable by flag, environment, `[hook]` in `.shortleash.toml` or the install. Warnings use `additionalContext` and `systemMessage` and never send an `allow`. Off unless asked for; fails open; documented limits in the README.
+- Repeat-call guard for hook mode (`shortleash hook install --loop-guard`): a per-session log of tool-call fingerprints (tool name + SHA-256 of the whole input; white space collapsed only in a Bash command; the input itself is never stored). Default metric is the same call N times in a row (warn at 6); a window metric is optional. **Refusing is off by default**: `--loop-deny N` (at least 12 unless `--force-low`) turns it on, a refused call is not recorded, and a project `.shortleash.toml` cannot set a deny below 12. Warnings use `additionalContext` and `systemMessage` and never send an `allow`. Append-only state (no rewrite, so no lost lines), `hook uninstall` removes the saved settings, `hook status` warns when a shared matcher group hides tools from the guard. Optional spend-velocity warning. The README lists the false positives (test re-runs, polling, re-reads) and the measured per-call cost.
 
 ## 0.2.0
 
