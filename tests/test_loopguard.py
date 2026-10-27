@@ -16,6 +16,7 @@ from unittest import mock
 from shortleash import cli as cli_mod
 from shortleash import hookmode
 from shortleash import loopguard
+from shortleash import paths
 from shortleash import profile
 
 
@@ -458,6 +459,24 @@ class TestPrivateState(Base):
         self.assertEqual(errs, [])
         with open(path, encoding="utf-8") as f:
             self.assertEqual(len(f.readlines()), 200)
+
+    def test_windows_branch_locks_around_the_write(self):
+        # the Windows path, exercised here with a stand-in msvcrt
+        import sys
+        import types
+        from unittest import mock
+        calls = []
+        fake = types.SimpleNamespace(
+            LK_LOCK=1, LK_UNLCK=0,
+            locking=lambda fd, mode, n: calls.append(mode))
+        path = os.path.join(tempfile.mkdtemp(), "w.loop")
+        with mock.patch.dict(sys.modules, {"msvcrt": fake}), \
+                mock.patch.object(paths.os, "name", "nt"):
+            paths.append_private(path, b"one\n")
+            paths.append_private(path, b"two\n")
+        self.assertEqual(calls, [1, 0, 1, 0])
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"one\ntwo\n")
 
     def test_velocity_marker_survives_many_calls(self):
         path = hookmode.loop_file("v2")

@@ -10,6 +10,7 @@ is set after the module was imported.
 from __future__ import annotations
 
 import os
+import threading
 
 STATE_ENV = "SHORTLEASH_HOME"
 
@@ -54,12 +55,52 @@ def private_dir(path: str) -> None:
             pass
 
 
+_APPEND_LOCK = threading.Lock()
+#: a byte far beyond any state file; Windows lets a region past the end of a
+#: file be locked, so readers and the writes themselves are never blocked by it
+_WIN_LOCK_OFFSET = 0x7FFFFF00
+
+
+def _win_lock(fd: int, lock: bool) -> None:
+    import msvcrt
+    os.lseek(fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
+    if not lock:
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        return
+    for _ in range(600):                 # LK_LOCK itself retries ~10 s
+        try:
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            return
+        except OSError:
+            continue
+    raise OSError("could not lock the state file for appending")
+
+
 def append_private(path: str, data: bytes) -> None:
-    """Append ``data`` to ``path`` with ONE write (two processes appending
-    at once interleave whole records, never halves); the file is created
-    0600."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    try:
-        os.write(fd, data)
-    finally:
-        os.close(fd)
+    """Append ``data`` to ``path`` as ONE record: two threads or processes
+    appending at once interleave whole records, never halves, and none is
+    lost. The file is created 0600.
+
+    POSIX: a single write() to an O_APPEND file is atomic. Windows: the C
+    runtime fakes append by seeking to the end and then writing, so two
+    writers can both seek to the same end and overwrite each other; there
+    the seek-and-write is done under an OS byte-range lock (msvcrt.locking)
+    and, inside this process, a mutex."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
+    with _APPEND_LOCK:
+        fd = os.open(path, flags, 0o600)
+        try:
+            if os.name == "nt":
+                _win_lock(fd, True)
+                try:
+                    os.lseek(fd, 0, os.SEEK_END)
+                    os.write(fd, data)
+                finally:
+                    try:
+                        _win_lock(fd, False)
+                    except OSError:
+                        pass
+            else:
+                os.write(fd, data)
+        finally:
+            os.close(fd)
