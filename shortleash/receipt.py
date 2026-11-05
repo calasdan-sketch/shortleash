@@ -13,8 +13,26 @@ from . import __version__
 # Any argument whose NAME matches one of these (case-insensitive) gets its
 # VALUE replaced with *** in receipts. Matches --api-key, api_key=, -token,
 # --db-password value, etc.
-_SECRET_NAME_RE = re.compile(r"key|token|secret|password|passwd",
-                             re.IGNORECASE)
+_SECRET_NAME_RE = re.compile(
+    r"key|token|secret|password|passwd|auth|bearer|credential|cookie",
+    re.IGNORECASE)
+#: Strings shaped like well-known credentials, wherever they appear in an
+#: argument (a prompt, a header, JSON): replaced by *** in receipts.
+_KEY_SHAPES = re.compile(
+    r"(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{16,}"
+    r"|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|glpat-[A-Za-z0-9_-]{20,}"
+    r"|xox[abposr]-[A-Za-z0-9-]{10,}"
+    r"|(?:AKIA|ASIA)[0-9A-Z]{16}"
+    r"|AIza[0-9A-Za-z_-]{35})")
+#: `Authorization: Bearer x`, `Bearer x`, `Basic x` inside an argument.
+_SCHEME_RE = re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}")
+#: A secret-named field inside an argument: `"api_key": "v"` (JSON),
+#: `X-Api-Key: v` (a header), `password=v` inside a longer string.
+_FIELD_RE = re.compile(
+    r"""(?i)(["']?[\w-]*(?:key|token|secret|password|passwd|auth\w*|cookie)"""
+    r"""[\w-]*["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;}&]+)""")
 _FLAG_EQ_RE = re.compile(r"^(--?)([A-Za-z0-9_][A-Za-z0-9_-]*)=(.*)$")
 _BARE_EQ_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_-]*)=(.*)$")
 _FLAG_RE = re.compile(r"^(--?)([A-Za-z0-9_][A-Za-z0-9_-]*)$")
@@ -27,6 +45,21 @@ REDACTED_PROMPT = "<redacted>"
 
 def _is_secret_name(name: str) -> bool:
     return _SECRET_NAME_RE.search(name) is not None
+
+
+def _field_sub(m) -> str:
+    value = m.group(2)
+    quote = value[0] if value[:1] in ("'", '"') else ""
+    return f"{m.group(1)}{quote}***{quote}"
+
+
+def scrub(text: str) -> str:
+    """Credential-shaped substrings of one argument replaced by ***:
+    well-known key formats, `Bearer x`, and secret-named fields in JSON or
+    headers. Over-redaction is the safe direction."""
+    text = _KEY_SHAPES.sub("***", text)
+    text = _SCHEME_RE.sub(lambda m: f"{m.group(1)} ***", text)
+    return _FIELD_RE.sub(_field_sub, text)
 
 
 def redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
@@ -85,7 +118,7 @@ def redact_argv(argv: list[str], redact_prompt: bool = False) -> list[str]:
             redact_next = True
             continue
         out.append(a)
-    return out
+    return [a if a in ("***", REDACTED_PROMPT) else scrub(a) for a in out]
 
 
 def _sanitize(obj):

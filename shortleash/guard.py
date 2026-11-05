@@ -360,7 +360,8 @@ class Guard:
         self._paused = False
         self.approval: dict | None = None  # receipt "approval" field
         # Tool calls in order (fingerprints, see loops), for --max-repeats.
-        self._calls: collections.deque[str] = collections.deque(
+        # [call id, fingerprint, result digest or None], oldest first
+        self._calls: collections.deque[list] = collections.deque(
             maxlen=loops.HISTORY)
         self._seen_calls: collections.OrderedDict[str, None] = \
             collections.OrderedDict()
@@ -430,32 +431,38 @@ class Guard:
         # can never drive totals down and blind the caps.
         with self._lock:
             u = {k: max(0, obs["usage"].get(k, 0)) for k in self.usage}
+            u["cache_write_1h"] = max(0, obs["usage"].get("cache_write_1h", 0))
             mid = obs.get("message_id") or ""
+            prev = self._seen_messages.get(mid) if mid else None
             model = str(obs.get("model") or self.model)[:200]
+            # (a model with a long-prompt tier is priced per request: the
+            # first copy of a message decides, its later copies follow)
+            model = prev["__key"] if prev else pricing.price_key(model, u)
             if (model not in self._usage_by_model
                     and len(self._usage_by_model) >= MAX_MODELS):
                 # a child naming a new model on every message must not grow
                 # this without bound: the rest is priced at the session's
                 model = self.model
             per_model = self._usage_by_model.setdefault(
-                model, {k: 0 for k in self.usage})
-            if mid and mid in self._seen_messages:
+                model, {k: 0 for k in u})
+            if prev is not None:
                 # Same API response, next content block: usage repeats.
                 # Count only growth (output tokens can still rise), never
                 # the same tokens twice.
-                prev = self._seen_messages[mid]
-                for k in self.usage:
+                for k in u:
                     grow = max(0, u[k] - prev[k])
-                    self.usage[k] += grow
+                    if k in self.usage:
+                        self.usage[k] += grow
                     per_model[k] += grow
                     prev[k] = max(prev[k], u[k])
                 self._seen_messages.move_to_end(mid)
             else:
-                for k in self.usage:
-                    self.usage[k] += u[k]
+                for k in u:
+                    if k in self.usage:
+                        self.usage[k] += u[k]
                     per_model[k] += u[k]
                 if mid:
-                    self._seen_messages[mid] = dict(u)
+                    self._seen_messages[mid] = dict(u, __key=model)
                     while len(self._seen_messages) > _MESSAGE_WINDOW:
                         self._seen_messages.popitem(last=False)
             spawn_ids = obs.get("spawn_ids")
@@ -474,11 +481,21 @@ class Guard:
                 self._seen_calls[key] = None
                 while len(self._seen_calls) > _CALL_WINDOW:
                     self._seen_calls.popitem(last=False)
-                self._calls.append(fp)
+                self._calls.append([key, fp, None])
             if not obs.get("usage_unreadable"):
                 # (an event whose usage block the leash cannot read is not
                 # usage telemetry: it must not make a token cap look live)
                 self.usage_events += 1
+
+    def _add_results(self, results) -> None:
+        """Attach each tool result's digest to its call (loop detection
+        compares results too, when they are known)."""
+        with self._lock:
+            for tid, digest in results:
+                for entry in reversed(self._calls):
+                    if entry[0] == tid:
+                        entry[2] = digest
+                        break
 
     def _cost_by_model(self, by_model: dict) -> float:
         return sum(pricing.estimate_cost(m, u, self.pricing_table)
@@ -635,7 +652,7 @@ class Guard:
             )
         if self.max_repeats is not None:
             with self._lock:
-                calls = list(self._calls)[-loops.MAX_PERIOD * self.max_repeats:]
+                calls = [(fp, res) for _, fp, res in self._calls]
             block = loops.find_loop(calls, self.max_repeats)
             if block:
                 return loops.describe(block, self.max_repeats)
@@ -763,6 +780,12 @@ class Guard:
                 if (self.ask_over is not None and self.approval is None
                         and self.estimated_cost() > self.ask_over):
                     self._gate()
+        elif kind == "tool_results":
+            self._add_results(obs["results"])
+            if self.max_repeats is not None:
+                reason = self._check_caps()
+                if reason:
+                    self._trip(reason)
         elif kind == "result":
             cost = None
             if obs.get("cost_usd") is not None:
@@ -1148,6 +1171,11 @@ class Guard:
                     f"past runs recorded for "
                     f"{self.profile or self.agent or 'this agent'}) — only "
                     f"the static caps apply to this run")
+        stale = pricing.stale_note(self.pricing_table.as_of)
+        if stale:
+            self.warnings.append(stale)
+            if not self.quiet:
+                _say(f"[shortleash] warning: {stale}\n")
         self.proc = None
         self.job = None
         # Resolve the executable ourselves (PATHEXT shims on Windows) and
@@ -1471,7 +1499,7 @@ class Guard:
         with self._lock:
             by_model = {m: dict(u) for m, u in self._usage_by_model.items()}
         return {(m or "?"): {
-                    "tokens": sum(u.values()),
+                    "tokens": sum(u[k] for k in events.USAGE_KEYS),
                     "cost_usd": round(pricing.estimate_cost(
                         m, u, self.pricing_table), 6)}
                 for m, u in by_model.items() if any(u.values())}

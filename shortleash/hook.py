@@ -79,7 +79,8 @@ class HookError(Exception):
 
 
 def _empty_usage() -> dict:
-    return {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
+    return {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0,
+            "cache_write_1h": 0}
 
 
 class SessionTally:
@@ -94,7 +95,8 @@ class SessionTally:
         self.bad_lines = 0
 
     def tokens(self) -> int:
-        return sum(sum(u.values()) for u in self.usage_by_model.values())
+        return sum(sum(u.get(k, 0) for k in events.USAGE_KEYS)
+                   for u in self.usage_by_model.values())
 
     def estimated_cost(self, table) -> float:
         return sum(pricing.estimate_cost(m, u, table)
@@ -122,16 +124,21 @@ class SessionTally:
         self.files += 1
         seen: dict[str, dict] = {}
         order: list[str] = []
-        calls: list[tuple[str, str]] = []
+        calls: list[list] = []  # [call id, fingerprint, result digest]
         seen_calls: set[str] = set()
+        results: dict[str, str] = {}
         with f:
             for line in f:
-                if '"assistant"' not in line and '"cost-state"' not in line:
-                    continue  # cheap filter: most lines are neither
+                if ('"assistant"' not in line and '"cost-state"' not in line
+                        and '"tool_result"' not in line):
+                    continue  # cheap filter: most lines are none of these
                 try:
                     ev = json.loads(line)
-                except ValueError:
-                    self.bad_lines += 1  # a line still being written
+                except (ValueError, RecursionError):
+                    # a line still being written -- or one nested too deep
+                    # to parse: never a crash (a crash would let the call
+                    # through)
+                    self.bad_lines += 1
                     continue
                 if not isinstance(ev, dict):
                     continue
@@ -141,28 +148,33 @@ class SessionTally:
                             and c == c and 0 <= c < 1e12):
                         self.reported_cost = float(c)
                     continue
-                if ev.get("type") != "assistant":
-                    continue
                 msg = ev.get("message")
                 if not isinstance(msg, dict):
                     continue
                 try:
-                    self._add_message(msg, seen, order, calls, seen_calls)
-                except (TypeError, ValueError, OverflowError):
+                    if ev.get("type") == "user":
+                        results.update(events._tool_results(msg))
+                    elif ev.get("type") == "assistant":
+                        self._add_message(msg, seen, order, calls, seen_calls)
+                except (TypeError, ValueError, OverflowError, RecursionError):
                     self.bad_lines += 1
+        for entry in calls:
+            entry[2] = results.get(entry[0])
         self.calls[path] = calls
 
     def _add_message(self, msg, seen, order, calls, seen_calls) -> None:
         usage = events._usage_of(msg)
         u = {k: max(0, v) for k, v in usage.items()}
+        u.setdefault("cache_write_1h", 0)
         mid = str(msg.get("id") or "")
+        prev = seen.get(mid) if mid else None
         model = str(msg.get("model") or "")[:200]
+        model = prev["__key"] if prev else pricing.price_key(model, u)
         if (model not in self.usage_by_model
                 and len(self.usage_by_model) >= _MAX_MODELS):
             model = ""  # bounded: an unknown model is priced at the default
         per = self.usage_by_model.setdefault(model, _empty_usage())
-        if mid and mid in seen:
-            prev = seen[mid]
+        if prev is not None:
             for k in u:
                 per[k] += max(0, u[k] - prev[k])
                 prev[k] = max(prev[k], u[k])
@@ -170,7 +182,7 @@ class SessionTally:
             for k in u:
                 per[k] += u[k]
             if mid:
-                seen[mid] = dict(u)
+                seen[mid] = dict(u, __key=model)
                 order.append(mid)
                 if len(order) > _MESSAGE_WINDOW:
                     seen.pop(order.pop(0), None)
@@ -181,7 +193,7 @@ class SessionTally:
             key = f"{mid}:{cid}" if cid.startswith("<no-id>") else cid
             if key not in seen_calls:
                 seen_calls.add(key)
-                calls.append((cid, fp))
+                calls.append([cid, fp, None])
 
 
 def subagent_transcripts(transcript_path: str) -> list[str]:
@@ -194,7 +206,23 @@ def subagent_transcripts(transcript_path: str) -> list[str]:
     return sorted(glob.glob(pattern))
 
 
+def main_transcript(transcript_path: str) -> str:
+    """The session's main transcript. The hooks reference does not say
+    whether a hook fired inside a subagent gets the session's transcript or
+    the subagent's own (<dir>/<session>/subagents/agent-<id>.jsonl); given
+    the latter, the main one is <dir>/<session>.jsonl, so the WHOLE
+    session's spend is counted either way."""
+    parent = os.path.dirname(transcript_path)
+    if os.path.basename(parent).lower() == "subagents":
+        session_dir = os.path.dirname(parent)
+        candidate = session_dir + ".jsonl"
+        if os.path.isfile(candidate):
+            return candidate
+    return transcript_path
+
+
 def tally_session(transcript_path: str) -> SessionTally:
+    transcript_path = main_transcript(transcript_path)
     t = SessionTally()
     t.read_file(transcript_path, main=True)
     for p in subagent_transcripts(transcript_path):
@@ -241,15 +269,17 @@ def decide(event: dict, tally: SessionTally, *, budget=None, ask_over=None,
     if max_repeats is not None:
         calls = _calls_for(event, tally)
         tid = str(event.get("tool_use_id") or "")
-        ids = [cid for cid, _ in calls]
+        ids = [c[0] for c in calls]
         if tid and tid in ids:
             # already in the transcript (it can be, or lag): judge the
             # sequence up to and including this call, not what follows it
             calls = calls[:len(ids) - ids[::-1].index(tid)]
+            calls[-1] = [calls[-1][0], calls[-1][1], None]  # not run yet
         else:
-            calls = calls + [(tid, loops.fingerprint(
-                event.get("tool_name"), event.get("tool_input")))]
-        block = loops.find_loop([fp for _, fp in calls], max_repeats)
+            calls = calls + [[tid, loops.fingerprint(
+                event.get("tool_name"), event.get("tool_input")), None]]
+        block = loops.find_loop([(fp, res) for _, fp, res in calls],
+                                max_repeats)
         if block:
             return {"decision": "deny", "stop": False,
                     "reason": (f"shortleash: {loops.describe(block, max_repeats)}"
@@ -269,7 +299,7 @@ def decide(event: dict, tally: SessionTally, *, budget=None, ask_over=None,
 def _calls_for(event: dict, tally: SessionTally) -> list:
     """The call sequence of the agent this event belongs to: the subagent's
     own transcript when the hook fires inside one, else the main one."""
-    transcript = str(event.get("transcript_path") or "")
+    transcript = main_transcript(str(event.get("transcript_path") or ""))
     agent_id = event.get("agent_id")
     if agent_id:
         stem = os.path.splitext(transcript)[0]
@@ -318,6 +348,27 @@ def _log(event: dict, decision: dict, tally: SessionTally, table) -> None:
         pass
 
 
+def _first_time(event: dict, notes: list[str]) -> bool:
+    """True the first time these notes are seen for this session (a marker
+    file in the state directory), so a warning is shown once, not on every
+    tool call. Without a usable state directory: always True."""
+    import hashlib
+    key = hashlib.sha256((str(event.get("session_id") or "") + "\0"
+                          + "\0".join(notes)).encode("utf-8", "replace")
+                         ).hexdigest()[:24]
+    marker_dir = os.path.join(paths.state_dir(), "hook-notes")
+    marker = os.path.join(marker_dir, key)
+    try:
+        if os.path.exists(marker):
+            return False
+        os.makedirs(marker_dir, exist_ok=True)
+        with open(marker, "w", encoding="utf-8"):
+            pass
+    except OSError:
+        pass
+    return True
+
+
 def read_event(stream) -> dict:
     raw = stream.read(MAX_INPUT + 1)
     if isinstance(raw, bytes):
@@ -326,6 +377,8 @@ def read_event(stream) -> dict:
         raise HookError("hook input larger than 4 MB")
     try:
         event = json.loads(raw)
+    except RecursionError:
+        raise HookError("hook input is nested too deeply") from None
     except ValueError as e:
         raise HookError(f"hook input is not JSON ({e})") from None
     if not isinstance(event, dict):
@@ -345,7 +398,31 @@ def run_hook(args, stdin=None, stdout=None, stderr=None) -> int:
     stdout = stdout or sys.stdout
     stderr = stderr or sys.stderr
     try:
+        return _run_hook(args, stdin, stdout, stderr)
+    except Exception as e:  # anything at all: never a traceback, and under
+        # --fail-closed never a pass (exit 1 would let the call through)
+        try:
+            stderr.write(f"shortleash hook: internal error: "
+                         f"{type(e).__name__}: {e}\n")
+        except Exception:
+            pass
+        return 2 if getattr(args, "fail_closed", False) else 1
+
+
+def _run_hook(args, stdin, stdout, stderr) -> int:
+    notes: list[str] = []
+    try:
         table = pricing.load_table(args.pricing)
+    except (OSError, ValueError) as e:
+        # A pricing file that cannot be loaded must not switch the caps
+        # off: price with the built-in table and say so.
+        table = pricing.PricingTable(rates=dict(pricing.DEFAULT_PRICING))
+        notes.append(f"pricing file unusable ({e}); the built-in table was "
+                     f"used")
+    stale = pricing.stale_note(table.as_of)
+    if stale:
+        notes.append(stale)
+    try:
         event = read_event(stdin)
         name = event.get("hook_event_name")
         if name not in (None, "PreToolUse"):
@@ -354,14 +431,22 @@ def run_hook(args, stdin=None, stdout=None, stderr=None) -> int:
         if not isinstance(transcript, str) or not transcript:
             raise HookError("hook input has no transcript_path")
         tally = tally_session(transcript)
-    except (HookError, OSError, ValueError) as e:
+    except (HookError, OSError, ValueError, RecursionError) as e:
         stderr.write(f"shortleash hook: {e}\n")
         return 2 if args.fail_closed else 1
     decision = decide(event, tally, budget=args.budget, ask_over=args.ask_over,
                       max_tokens=args.max_tokens, max_spawns=args.max_spawns,
                       max_repeats=args.max_repeats, table=table)
     if decision is None:
+        if notes and _first_time(event, notes):
+            # exit 0 with a systemMessage: shown to the user, once per
+            # session, and the call goes ahead as it would have
+            stdout.write(json.dumps({"systemMessage": "shortleash: "
+                                     + "; ".join(notes)}) + "\n")
+            stdout.flush()
         return 0
+    if notes:
+        decision["reason"] += " (" + "; ".join(notes) + ")"
     unpriced = tally.unpriced_models(table)
     if unpriced and decision["decision"] == "deny" and "budget" in decision["reason"]:
         decision["reason"] += (f" (models not in the pricing table, priced at "
@@ -386,7 +471,8 @@ def hook_command(args, executable: str | None = None) -> str:
                         ("--max-tokens", args.max_tokens),
                         ("--max-spawns", args.max_spawns),
                         ("--max-repeats", args.max_repeats),
-                        ("--pricing", args.pricing)):
+                        ("--pricing", os.path.abspath(args.pricing)
+                         if args.pricing else None)):
         if value is not None:
             parts += [flag, f"{value:g}" if isinstance(value, float)
                       else str(value)]
@@ -398,9 +484,17 @@ def hook_command(args, executable: str | None = None) -> str:
     return shlex.join(parts)
 
 
-def settings_block(command: str) -> dict:
-    return {"hooks": {"PreToolUse": [
-        {"matcher": "*", "hooks": [{"type": "command", "command": command}]}]}}
+def settings_block(command: str, fail_closed: bool = False) -> dict:
+    """The settings JSON for the hook. With --fail-closed it also sets
+    ``"onFailure": "block"`` (Claude Code 2.1.295+): a hook that cannot
+    start, crashes or times out then blocks the call instead of letting it
+    through -- --fail-closed alone only covers failures the hook itself
+    sees -- and a 60-second timeout instead of the default 600."""
+    hook = {"type": "command", "command": command}
+    if fail_closed:
+        hook["onFailure"] = "block"
+        hook["timeout"] = 60
+    return {"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [hook]}]}}
 
 
 def _is_ours(entry) -> bool:
@@ -413,7 +507,8 @@ def _is_ours(entry) -> bool:
     return False
 
 
-def merge_settings(settings: dict, command: str) -> dict:
+def merge_settings(settings: dict, command: str,
+                   fail_closed: bool = False) -> dict:
     """``settings`` with our PreToolUse hook in it: an earlier shortleash
     hook entry is replaced, every other hook is kept as it was."""
     if not isinstance(settings, dict):
@@ -427,13 +522,14 @@ def merge_settings(settings: dict, command: str) -> dict:
     if not isinstance(pre, list):
         raise ValueError('"hooks.PreToolUse" in the settings file is not a list')
     pre = [e for e in pre if not _is_ours(e)]
-    pre.append(settings_block(command)["hooks"]["PreToolUse"][0])
+    pre.append(settings_block(command, fail_closed)["hooks"]["PreToolUse"][0])
     hooks["PreToolUse"] = pre
     out["hooks"] = hooks
     return out
 
 
-def write_settings(path: str, command: str) -> str | None:
+def write_settings(path: str, command: str,
+                   fail_closed: bool = False) -> str | None:
     """Merge the hook into the settings file at ``path`` (created when
     missing). The previous file is kept as ``<path>.bak``; the write is
     atomic. Returns the backup's path, or None when there was no file."""
@@ -450,7 +546,7 @@ def write_settings(path: str, command: str) -> str | None:
                              f"not touching it") from None
         backup = path + ".bak"
         shutil.copyfile(path, backup)
-    merged = merge_settings(settings, command)
+    merged = merge_settings(settings, command, fail_closed)
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".settings-", suffix=".json",

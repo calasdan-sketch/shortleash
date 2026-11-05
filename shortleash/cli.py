@@ -374,10 +374,18 @@ def _cmd_hook_install(args) -> int:
               "--ask-over, --max-tokens, --max-spawns, --max-repeats)",
               file=sys.stderr)
         return 2
+    if args.pricing:
+        try:
+            pricing.load_table(args.pricing)
+        except (OSError, ValueError) as e:
+            print(f"shortleash: error: can't load pricing file "
+                  f"{args.pricing}: {e}", file=sys.stderr)
+            return 2
     command = hook_mod.hook_command(args)
     if args.write:
         try:
-            backup = hook_mod.write_settings(args.write, command)
+            backup = hook_mod.write_settings(args.write, command,
+                                             args.fail_closed)
         except (OSError, ValueError) as e:
             print(f"shortleash: error: {e}", file=sys.stderr)
             return 2
@@ -389,7 +397,8 @@ def _cmd_hook_install(args) -> int:
     print("# Add this to .claude/settings.json (project) or "
           "~/.claude/settings.json (all projects),")
     print("# or run this command again with --write .claude/settings.json")
-    print(json.dumps(hook_mod.settings_block(command), indent=2))
+    print(json.dumps(hook_mod.settings_block(command, args.fail_closed),
+                     indent=2))
     return 0
 
 

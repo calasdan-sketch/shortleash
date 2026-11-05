@@ -116,6 +116,32 @@ class TestLoops(unittest.TestCase):
             seq.append(self.fp("Bash", command="pytest"))
         self.assertIsNone(loops.find_loop(seq, 3))
 
+    def test_same_call_with_changing_results_is_not_a_loop(self):
+        A = self.fp("Bash", command="pytest")
+        seq = [(A, f"r{i}") for i in range(10)]
+        self.assertIsNone(loops.find_loop(seq, 3))
+        same = [(A, "r")] * 3
+        self.assertEqual(loops.find_loop(same, 3), [A])
+        # a pending call borrows the last result of the identical call
+        self.assertEqual(loops.find_loop([(A, "r"), (A, "r"), (A, None)], 3), [A])
+        self.assertIsNone(loops.find_loop([(A, "r1"), (A, "r2"), (A, None)], 3))
+
+    def test_polling_tools_are_exempt_but_not_what_they_poll(self):
+        P = self.fp("BashOutput", bash_id="b1")
+        self.assertIsNone(loops.find_loop([P] * 20, 3))
+        T = self.fp("TaskGet", id="1")
+        self.assertIsNone(loops.find_loop([P, T] * 10, 3))
+        B = self.fp("Bash", command="sleep 5")
+        self.assertEqual(loops.find_loop([B, P] * 3, 3), [B, P])
+
+    def test_period_four_and_trailing_whitespace(self):
+        A, B, C, D = (self.fp(x) for x in "ABCD")
+        self.assertEqual(loops.find_loop([A, B, C, D] * 3, 3), [A, B, C, D])
+        self.assertEqual(loops.fingerprint("Bash", {"command": "ls  \n"}),
+                         loops.fingerprint("Bash", {"command": "ls"}))
+        self.assertNotEqual(loops.fingerprint("Bash", {"command": "l s"}),
+                            loops.fingerprint("Bash", {"command": "ls"}))
+
     def test_events_carry_tool_calls_and_model(self):
         obs = events.parse_line(assistant(
             "m1", ("t1", "Bash", {"command": "ls"}), model="claude-opus-4-5"))
@@ -127,7 +153,88 @@ class TestLoops(unittest.TestCase):
 # ---------------------------------------------------------------------
 # the leash: loop, stuck, forecast, per-model pricing, markdown
 
+def tool_result(tid, content):
+    return json.dumps({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": tid, "content": content}]}})
+
+
 class TestRunCaps(unittest.TestCase):
+    def test_a_retried_test_whose_output_changes_is_not_a_loop(self):
+        lines = [INIT]
+        for i in range(6):
+            lines += [assistant(f"m{i}", (f"t{i}", "Bash", {"command": "pytest"})),
+                      tool_result(f"t{i}", f"{5 - i} failed")]
+        g = Guard(max_repeats=3, quiet=True)
+        code, rec, _, _ = run_guard(g, lingerer(*lines, sleep=0))
+        self.assertEqual(code, 0)
+        self.assertFalse(rec["breached"])
+
+    def test_a_retried_call_with_the_same_failure_is_a_loop(self):
+        lines = [INIT]
+        for i in range(6):
+            lines += [assistant(f"m{i}", (f"t{i}", "Bash", {"command": "pytest"})),
+                      tool_result(f"t{i}", "3 failed")]
+        g = Guard(max_repeats=3, quiet=True, grace_period=0.5)
+        code, rec, _, _ = run_guard(g, lingerer(*lines))
+        self.assertEqual(code, BREACH_EXIT_CODE)
+        self.assertIn("loop detected", rec["breach_reason"])
+
+    def test_deep_json_in_the_stream_fails_closed(self):
+        deep = '{"type":"assistant","message":' + "[" * 20000 + "]" * 20000 + "}"
+        g = Guard(budget=5.0, quiet=True, grace_period=0.5)
+        code, rec, _, _ = run_guard(g, lingerer(INIT, deep))
+        self.assertEqual(code, BREACH_EXIT_CODE)
+        self.assertIn("malformed telemetry", rec["breach_reason"])
+
+    def test_one_hour_cache_writes_and_the_haiku_tiers(self):
+        u1h = {"input_tokens": 0, "cache_creation_input_tokens": 1_000_000,
+               "cache_creation": {"ephemeral_1h_input_tokens": 1_000_000,
+                                  "ephemeral_5m_input_tokens": 0}}
+        g = Guard(budget=1000.0, quiet=True)
+        _, rec, _, _ = run_guard(g, lingerer(INIT, assistant("m", usage=u1h),
+                                             sleep=0))
+        self.assertAlmostEqual(rec["cost_usd"], 6.0)  # sonnet-4-5: 3 x 2
+        self.assertEqual(rec["tokens"]["cache_write"], 1_000_000)
+        short = {"input_tokens": 50_000, "output_tokens": 0}
+        long_ = {"input_tokens": 150_000, "output_tokens": 0}
+        g = Guard(budget=1000.0, quiet=True)
+        _, rec, _, _ = run_guard(g, lingerer(
+            INIT, assistant("a", usage=short, model="claude-haiku-5-5"),
+            assistant("b", usage=long_, model="claude-haiku-5-5"), sleep=0))
+        # 50K at $0.10 + 150K at $0.50 (long tier)
+        self.assertAlmostEqual(rec["cost_usd"], 0.005 + 0.075)
+        self.assertIn("claude-haiku-5-5#long", rec["models"])
+
+    def test_stale_prices_are_flagged(self):
+        import datetime
+        from shortleash import pricing
+        with mock.patch.dict(os.environ, {"SHORTLEASH_STALE_DAYS": "60"}):
+            self.assertIsNone(pricing.stale_note(
+                "2026-11-05", today=datetime.date(2026, 12, 1)))
+            note = pricing.stale_note("2026-11-05",
+                                      today=datetime.date(2027, 3, 1))
+            self.assertIn("116 days old", note)
+            self.assertIsNone(pricing.stale_note("unknown (no as_of in file)"))
+            g = Guard(quiet=True, pricing_table=pricing.PricingTable(
+                rates=dict(pricing.DEFAULT_PRICING), as_of="2020-01-01"))
+            _, rec, _, _ = run_guard(g, lingerer("x", sleep=0))
+            self.assertTrue(any("days old" in w for w in rec["warnings"]))
+        with mock.patch.dict(os.environ, {"SHORTLEASH_STALE_DAYS": "0"}):
+            self.assertIsNone(pricing.stale_note("2020-01-01"))
+
+    def test_receipts_scrub_credentials(self):
+        argv = ["claude", "-p", "deploy with sk-ant-abcdefghijklmnopqrstu",
+                "-H", "Authorization: Bearer abcdefgh12345678", "--auth", "u:p",
+                '{"api_key": "zzz", "n": 1}', "AKIAABCDEFGHIJKLMNOP",
+                "xoxb-1234567890-abc", "fix the token bucket in auth.py"]
+        red = receipt_mod.redact_argv(argv)
+        flat = " ".join(red)
+        for secret in ("sk-ant-abc", "abcdefgh12345678", "u:p", "zzz",
+                       "AKIAABCD", "xoxb-123"):
+            self.assertNotIn(secret, flat)
+        self.assertIn('"n": 1', flat)
+        self.assertEqual(red[-1], "fix the token bucket in auth.py")
+
     def test_a_repeated_call_trips_the_loop_cap_live(self):
         lines = [INIT] + [assistant(f"m{i}", (f"t{i}", "Bash", {"command": "npm test"}))
                           for i in range(6)]
@@ -168,7 +275,7 @@ class TestRunCaps(unittest.TestCase):
         code = ("import time\n"
                 "for i in range(8):\n"
                 "    print('tick', flush=True); time.sleep(0.25)")
-        g = Guard(idle_timeout=1.5, quiet=True)
+        g = Guard(idle_timeout=4.0, quiet=True)  # roomy: a slow interpreter start
         rc, rec, _, _ = run_guard(g, [PY, "-c", code])
         self.assertEqual(rc, 0)
         self.assertFalse(rec["breached"])
@@ -269,7 +376,14 @@ class TestApprovalGate(unittest.TestCase):
 
         def ask(text, timeout, cancelled):
             seen["text"] = text
-            seen["state"] = _state(g.proc.pid)
+            # SIGSTOP is delivered asynchronously: wait for the kernel to
+            # show the stop instead of sampling once (that was flaky)
+            deadline = time.monotonic() + 5.0
+            state = _state(g.proc.pid)
+            while state not in ("T", "t", None) and time.monotonic() < deadline:
+                time.sleep(0.01)
+                state = _state(g.proc.pid)
+            seen["state"] = state
             return "yes"
         g = Guard(budget=10.0, ask_over=0.5, ask_fn=ask, quiet=True)
         code, rec, _, _ = run_guard(g, lingerer(*self.LINES, sleep=0))
@@ -489,6 +603,58 @@ class TestHook(unittest.TestCase):
         self.assertEqual(self.hook(self.event(hook_event_name="PostToolUse"),
                                    "--budget", "0.01")[:2], (0, None))
 
+    def test_deep_json_never_crashes_and_fail_closed_blocks(self):
+        deep = "[" * 200000 + "]" * 200000
+        self.write(self.t, '{"type":"assistant","message":' + deep + "}\n",
+                   self.amsg("m1", {"input_tokens": 10_000_000}))
+        code, out, _ = self.hook(self.event(), "--budget", "1")
+        self.assertEqual(code, 0)  # the deep line is skipped, the rest counts
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        code, _, err = self.hook('{"a":' + deep + "}", "--budget", "1",
+                                 "--fail-closed")
+        self.assertEqual(code, 2)
+        with mock.patch.object(hook_mod, "decide", side_effect=RuntimeError("x")):
+            self.assertEqual(self.hook(self.event(), "--budget", "1",
+                                       "--fail-closed")[0], 2)
+            self.assertEqual(self.hook(self.event(), "--budget", "1")[0], 1)
+
+    def test_an_unloadable_pricing_file_falls_back_and_says_so(self):
+        self.write(self.t, self.amsg("m1", {"input_tokens": 10_000_000}))
+        code, out, _ = self.hook(self.event(), "--budget", "1", "--pricing",
+                                 os.path.join(self.tmp, "missing.json"))
+        self.assertEqual(code, 0)
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("budget exceeded", reason)
+        self.assertIn("pricing file unusable", reason)
+        # under the cap: a systemMessage, once per session
+        self.write(self.t, self.amsg("m1", {"input_tokens": 10}))
+        args = ("--budget", "100", "--pricing", os.path.join(self.tmp, "nope.json"))
+        _, out, _ = self.hook(self.event(), *args)
+        self.assertIn("pricing file unusable", out["systemMessage"])
+        self.assertIsNone(self.hook(self.event(), *args)[1])
+
+    def test_a_subagent_transcript_path_still_counts_the_whole_session(self):
+        u = {"input_tokens": 500_000}  # $1.50
+        self.write(self.t, self.amsg("m1", u))
+        self.write(self.sub, self.amsg("s1", u))
+        code, out, _ = self.hook(self.event(transcript_path=self.sub,
+                                            agent_id="a1"), "--budget", "2")
+        self.assertIn("$3.0000", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_hook_loop_compares_results(self):
+        def call(i, res):
+            return [self.amsg(f"m{i}", {"input_tokens": 1},
+                              tools=[(f"t{i}", "Bash", {"command": "make"})]),
+                    {"type": "user", "message": {"content": [
+                        {"type": "tool_result", "tool_use_id": f"t{i}",
+                         "content": res}]}}]
+        self.write(self.t, *call(1, "err A"), *call(2, "err B"))
+        ev = self.event(tool_input={"command": "make"}, tool_use_id="t9")
+        self.assertIsNone(self.hook(ev, "--max-repeats", "3")[1])
+        self.write(self.t, *call(1, "same"), *call(2, "same"))
+        self.assertEqual(self.hook(ev, "--max-repeats", "3")[1]
+                         ["hookSpecificOutput"]["permissionDecision"], "deny")
+
     def test_odd_field_types_do_not_crash(self):
         self.write(self.t, self.amsg("m1", {"input_tokens": 1}))
         code, out, _ = self.hook(self.event(tool_use_id=["x"], tool_name=7,
@@ -509,6 +675,27 @@ class TestHookInstall(unittest.TestCase):
     def setUp(self):
         self.tmp = _tmp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_fail_closed_install_sets_on_failure_block_and_abs_pricing(self):
+        pf = os.path.join(self.tmp, "p.json")
+        with open(pf, "w", encoding="utf-8") as f:
+            json.dump({"x": [1, 2]}, f)
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            code, out, _ = cli("hook", "install", "--budget", "5",
+                               "--pricing", "p.json", "--fail-closed")
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(code, 0)
+        hook = json.loads(out[out.index("{"):])["hooks"]["PreToolUse"][0]["hooks"][0]
+        self.assertEqual(hook["onFailure"], "block")
+        self.assertEqual(hook["timeout"], 60)
+        self.assertIn(os.path.abspath(pf), hook["command"].replace("'", ""))
+        code, out, _ = cli("hook", "install", "--budget", "5")
+        self.assertNotIn("onFailure", out)
+        self.assertEqual(cli("hook", "install", "--budget", "5", "--pricing",
+                             os.path.join(self.tmp, "missing.json"))[0], 2)
 
     def test_print_mode(self):
         code, out, _ = cli("hook", "install", "--budget", "5", "--ask-over", "3")

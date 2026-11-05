@@ -41,6 +41,10 @@ import json
 
 from . import loops
 
+#: The token counts of a usage dict (what is summed into a token total).
+#: Usage dicts may also carry "cache_write_1h", a subset of cache_write.
+USAGE_KEYS = ("input", "output", "cache_write", "cache_read")
+
 #: tool_use block names that mean "a subagent was spawned".
 SPAWN_TOOL_NAMES = frozenset({"Agent", "Task"})
 
@@ -64,12 +68,20 @@ def unreadable_usage(raw) -> list[str] | None:
 
 def _usage_of(message: dict) -> dict:
     u = (message or {}).get("usage") or {}
-    return {
+    out = {
         "input": int(u.get("input_tokens") or 0),
         "output": int(u.get("output_tokens") or 0),
         "cache_write": int(u.get("cache_creation_input_tokens") or 0),
         "cache_read": int(u.get("cache_read_input_tokens") or 0),
     }
+    # The part of cache_write that went to the 1-hour cache (billed at 2x
+    # input, not 1.25x). A subset of cache_write, never added to a token
+    # total: only pricing reads it.
+    cc = u.get("cache_creation")
+    if isinstance(cc, dict) and cc.get("ephemeral_1h_input_tokens"):
+        out["cache_write_1h"] = min(
+            max(0, int(cc["ephemeral_1h_input_tokens"])), out["cache_write"])
+    return out
 
 
 def _spawn_blocks(message: dict) -> list[str]:
@@ -95,6 +107,22 @@ def _tool_calls(message: dict) -> list[tuple[str, str]]:
             out.append((str(block.get("id") or f"<no-id>#{i}"),
                         loops.fingerprint(block.get("name"),
                                           block.get("input"))))
+    return out
+
+
+def _tool_results(message: dict) -> list[tuple[str, str]]:
+    """(tool_use_id, result digest) of every tool_result block in a user
+    message (the result of a call, for loop detection)."""
+    out: list[tuple[str, str]] = []
+    content = (message or {}).get("content")
+    if not isinstance(content, list):
+        return out
+    for block in content:
+        if (isinstance(block, dict) and block.get("type") == "tool_result"
+                and block.get("tool_use_id")):
+            out.append((str(block["tool_use_id"]),
+                        loops.result_digest(block.get("content"),
+                                            block.get("is_error"))))
     return out
 
 
@@ -139,6 +167,13 @@ def parse_line(line: str) -> dict | None:
             "model": str(message.get("model") or ""),
             "tool_calls": _tool_calls(message),
         }
+
+    if etype == "user":
+        message = ev.get("message")
+        results = _tool_results(message) if isinstance(message, dict) else []
+        if not results:
+            return None
+        return {"kind": "tool_results", "results": results}
 
     if etype == "result":
         text = ev.get("result")

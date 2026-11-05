@@ -25,6 +25,22 @@ New:
 - `--receipt-md PATH`: the receipt as Markdown, appended (for
   `$GITHUB_STEP_SUMMARY`); command and prompt left out, agent text escaped.
 
+Review fixes (panel round on 0.2.0):
+- The hook never crashes on deeply nested JSON (stdin or transcript); any
+  internal error exits 2 under `--fail-closed`. `hook install --fail-closed`
+  writes `"onFailure": "block"` and a 60 s timeout (Claude Code 2.1.295+).
+- An unloadable `--pricing` file in the hook falls back to the built-in
+  prices with a warning instead of disabling the caps; `hook install` makes
+  the path absolute and checks it.
+- Loop detection compares results when known, exempts polling tools,
+  looks for cycles of up to 4 calls and ignores trailing white space.
+- Haiku 5.5 priced per request by prompt length; 1-hour cache writes at 2x.
+- A warning when the price table is more than 60 days old
+  (`SHORTLEASH_STALE_DAYS`).
+- Receipts scrub credential-shaped strings, `Bearer` tokens, `--auth` and
+  secret-named JSON/header fields in every argument.
+- A hook given a subagent's transcript still counts the whole session.
+
 Changed:
 - Each message is priced at the model it names (a subagent on another model
   at its own rate), not all at the `system/init` model's rate.

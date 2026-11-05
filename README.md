@@ -90,15 +90,26 @@ shortleash run --budget 2 --receipt-md "$GITHUB_STEP_SUMMARY" -- claude -p "..."
 ### Loops and stalls (`--max-repeats`, `--idle-timeout`)
 
 `--max-repeats N` stops a run whose agent makes **the same tool call N times
-in a row** — same tool, same input — or repeats the same cycle of two or
-three calls N times (`Read a.py, Bash pytest, Read a.py, Bash pytest, …`).
-Calls with different inputs never form a loop, so a healthy edit-then-test
-cycle is not flagged however long it runs: each edit is different. `N` is at
-least 2; 3 to 5 is a sensible start. The reason names the tool and a short
+in a row** — same tool, same input, and, when the result is known, the same
+result — or repeats the same cycle of two to four calls N times (`Read a.py,
+Bash pytest, Read a.py, Bash pytest, …`). Calls with different inputs never
+form a loop, so a healthy edit-then-test cycle is not flagged however long it
+runs: each edit is different; and re-running the same test is not a loop
+while its output keeps changing (`5 failed`, `4 failed`, …). Trailing white
+space in inputs and results is ignored. Polling tools made to be called
+again and again (`BashOutput`, `TaskOutput`, `TaskGet`, `TaskList`,
+`Monitor`, …; the list is `loops.POLLING_TOOLS`) never form a loop on their
+own. `N` is at least 2; 3 to 5 is a sensible start. The reason names the tool and a short
 hash of its input (`loop detected: the same Bash call (input 3fa2c1d0) was
 made 4 times in a row`), never the input itself, which may hold a secret.
 Like the spawn cap, it needs per-message events (`max_repeats` is listed
 under `not_enforced` and the exit code is `125` without them).
+
+It can be evaded, and says so: matching is exact, so the same call with a
+trivially different input (another timestamp, a shifted line range, a space
+in the middle) or a result that changes every time (a clock, a PID) is not a
+repeat. It catches literal retries and short cycles, not every way an agent
+can go round in circles.
 
 `--idle-timeout SECONDS` stops a run that has printed nothing for that long
 (`stuck: no output from the agent for 600s`). It does not depend on the
@@ -167,9 +178,29 @@ it), counts the spend per model with the same pricing table, and:
 Every deny and ask is a line in `hook-log.jsonl` in the state directory
 (`~/.shortleash` or `$SHORTLEASH_HOME`): time, session, tool name, decision,
 reason, cost, tokens — never the tool's input. Input it cannot use (not
-JSON, no `transcript_path`, a bad `--pricing` file) is reported and the call
-goes ahead (exit `1`, a non-blocking hook error), unless you add
-`--fail-closed` (exit `2`: the call is blocked).
+JSON, nested too deeply, no `transcript_path`) or any internal error is
+reported and the call goes ahead (exit `1`, a non-blocking hook error),
+unless you add `--fail-closed` (exit `2`: the call is blocked). A transcript
+line that cannot be parsed is skipped, never a crash. A `--pricing` file
+that cannot be loaded does **not** switch the caps off: the built-in table
+is used and the warning is added to the decision's reason (or shown once per
+session as a `systemMessage`); `hook install` writes the pricing path as an
+absolute path and refuses a file it cannot load.
+
+`--fail-closed` only covers failures the hook itself notices. A hook that
+cannot start, crashes hard or times out is, by default, a non-blocking error
+in Claude Code and the call goes ahead. `hook install --fail-closed`
+therefore also writes `"onFailure": "block"` and `"timeout": 60` into the
+hook's settings — per the [hooks reference](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails)
+this makes any failure or timeout block the call, and it needs Claude Code
+2.1.295 or later. On an older Claude Code that field is not honoured, and a
+hook that hangs lets the call through after its timeout (600 s by default).
+
+Hooks inside subagents: the reference does not say whether
+`transcript_path` is then the session's transcript or the subagent's own
+(`<session>/subagents/agent-<id>.jsonl`). Either way the hook counts the
+**whole session** (the main transcript and every subagent's), and loops are
+judged on the sequence of the agent the call belongs to (`agent_id`).
 
 Honest limits of hook mode: a hook runs at tool calls only, so a cap is
 enforced at the **next tool call** after it is crossed, not mid-answer, and a
@@ -448,6 +479,14 @@ typed. Pass `--redact-prompt` to replace the argument after `-p`,
 prompt given any other way (bare positional, stdin, a file) is not
 recognised. The history file never stores command text.
 
+Inside every argument, the prompt included, credential-shaped text is also
+replaced by `***`: well-known key formats (`sk-…`, `sk-ant-…`, `ghp_…`,
+`github_pat_…`, `glpat-…`, `xox?-…`, `AKIA…`, `AIza…`), `Bearer x` /
+`Basic x`, flags and fields named like `auth` (`--auth u:p`,
+`Authorization: …`, `X-Api-Key: …`), and secret-named fields in JSON
+arguments (`{"api_key": "***"}`). It is pattern matching: a secret in no
+known shape and under no telling name is not caught.
+
 ### Prices are a hard-coded fallback — verify them
 
 The built-in table (`pricing.py`, USD per 1M tokens) is **not fetched from
@@ -473,10 +512,16 @@ rate. The built-in table was copied from
 [Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing)
 on 2026-11-05 and names each model version (Opus 5.5 at $4 / $20 with
 cache reads at 0.05×, Opus 4.5 at $5 / $25, Opus 4.1 at $15 / $75, …);
-cache writes are priced at the 5-minute rate (1.25×), so a 1-hour cache
-write (2×) is under-estimated until the agent's own `total_cost_usd`
-replaces the estimate at the end. Haiku 5.5 is priced at its higher (long
-prompt) tier. The entries of your file are tried
+cache writes are priced at the 5-minute rate (1.25×), and at 2× for the
+part the usage block reports as 1-hour cache writes
+(`cache_creation.ephemeral_1h_input_tokens`). Haiku 5.5 is priced per
+request by prompt length: up to 100K prompt tokens (input + cache reads +
+cache writes) at $0.10 / $0.50, above that at $0.50 / $2.50 (the receipt's
+`models` shows those requests as `claude-haiku-5-5#long`).
+
+A table whose `as_of` date is more than 60 days old gets a warning (banner,
+receipt, hook reason): prices may have changed. `SHORTLEASH_STALE_DAYS=N`
+changes the limit; `0` switches the warning off. The entries of your file are tried
 first and the built-in table after them; within each, the **longest**
 matching key wins, so `{"opus-4-5": [5, 25]}` prices `claude-opus-4-5` at
 5 / 25 while other opus models keep the built-in rate (before 0.1.1 the
