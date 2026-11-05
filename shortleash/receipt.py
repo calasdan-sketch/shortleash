@@ -134,12 +134,23 @@ def build_receipt(
     enforced_live: dict | None = None,
     breach_live: bool | None = None,
     price_assumed: bool = False,
+    models: dict | None = None,
+    budget: float | None = None,
+    approval: dict | None = None,
 ) -> dict:
     warnings = list(warnings or [])
     if cost_usd is not None and not math.isfinite(cost_usd):
         cost_usd = None
         warnings.append("the cost was not a finite number (absurd usage was "
                         "reported) and is shown as n/a")
+    duration = max(0.0, ended_at - started_at)
+    # Spend per minute over the whole run, and the share of --budget used:
+    # the numbers to size the next run's caps by. None when there is no
+    # cost figure (or no time passed to divide by).
+    burn = (round(cost_usd / duration * 60.0, 6)
+            if cost_usd is not None and duration >= 0.5 else None)
+    used = (round(cost_usd / budget * 100.0, 1)
+            if cost_usd is not None and budget else None)
     return {
         "tool": "shortleash",
         "version": __version__,
@@ -166,6 +177,15 @@ def build_receipt(
             "cache_read": usage.get("cache_read", 0),
         },
         "num_turns": num_turns,
+        "burn_rate_usd_per_min": burn,
+        "budget_usd": budget,
+        "budget_used_pct": used,
+        # The live estimate per model (a subagent on another model is
+        # priced at its own rate): {model: {"tokens", "cost_usd"}}.
+        "models": dict(models or {}),
+        # --ask-over: {"threshold_usd", "cost_at_ask_usd", "answer",
+        # "waited_s"} once the gate was reached, else None.
+        "approval": approval,
         "subagent_spawns": spawns,
         "exit_code": exit_code,
         # What the child itself returned, untouched: a negative "killed by
@@ -246,6 +266,21 @@ def format_human(receipt: dict) -> str:
         f"  turns:     {receipt['num_turns']}   spawns: {receipt['subagent_spawns']}",
         f"  duration:  {receipt['duration_s']}s   exit: {receipt['exit_code']}",
     ]
+    rate = receipt.get("burn_rate_usd_per_min")
+    if rate is not None and telemetry:
+        used = receipt.get("budget_used_pct")
+        lines.append(f"  rate:      ${rate:.4f}/min"
+                     + (f"   budget used: {used:g}%" if used is not None
+                        else ""))
+    approval = receipt.get("approval")
+    if approval:
+        lines.append(f"  approval:  asked at ${approval['cost_at_ask_usd']:.4f} "
+                     f"(threshold ${approval['threshold_usd']:g}): "
+                     f"{approval['answer']} after {approval['waited_s']}s")
+    models = receipt.get("models") or {}
+    if len(models) > 1:
+        lines.append("  models:    " + ", ".join(
+            f"{m} ${v['cost_usd']:.4f}" for m, v in models.items()))
     pricing = receipt.get("pricing")
     if pricing and telemetry and receipt.get("cost_estimated", True):
         lines.append(f"  pricing:   {pricing.get('source', 'table')} as of "
@@ -306,3 +341,71 @@ def prepare_receipt_path(path: str) -> None:
 def write_receipt(receipt: dict, path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(_sanitize(receipt), f, indent=2, allow_nan=False)
+
+
+def _md_cell(text) -> str:
+    """One Markdown table cell: no pipes, no newlines, no markup, bounded."""
+    text = str(text)[:500]
+    # Text from the agent can reach a cell (an error message): no HTML, no
+    # links, no table breakage -- it is shown as the plain text it is.
+    for ch, esc in (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"),
+                    ("|", "\\|"), ("[", "\\["), ("]", "\\]"),
+                    ("`", "\\`"), ("\r", " "), ("\n", " ")):
+        text = text.replace(ch, esc)
+    return text
+
+
+def format_markdown(receipt: dict) -> str:
+    """The receipt as a Markdown block (a GitHub Actions job summary, a PR
+    comment). The command and the prompt are left out on purpose: a
+    summary is shown to everyone who can see the job."""
+    t = receipt["tokens"]
+    total = t["input"] + t["output"] + t["cache_write"] + t["cache_read"]
+    if receipt["breached"]:
+        verb = ("EXCEEDED" if receipt.get("breach_live") is False
+                else "STOPPED")
+        status = f"**{verb}**: {_md_cell(receipt['breach_reason'])}"
+    elif receipt.get("agent_error"):
+        status = (f"**FAILED**: the agent reported an error "
+                  f"({_md_cell(receipt.get('agent_error_text') or 'no detail')})")
+    elif not receipt.get("telemetry_seen", True):
+        status = f"**WARNING**: {_md_cell(no_telemetry_line(receipt))}"
+    elif receipt.get("not_enforced"):
+        status = (f"**WARNING**: NOT enforced: "
+                  f"{_md_cell(', '.join(receipt['not_enforced']))}")
+    else:
+        status = "finished within guardrails"
+    if receipt["cost_usd"] is None:
+        cost = "n/a"
+    else:
+        cost = (f"${receipt['cost_usd']:.4f} "
+                + ("(estimated)" if receipt["cost_estimated"] else "(reported)"))
+    rows = [
+        ("status", status),
+        ("agent", _md_cell(receipt.get("agent") or "?")
+         + (f" ({_md_cell(receipt['model'])})" if receipt.get("model") else "")),
+        ("cost", cost + (f", {receipt['budget_used_pct']:g}% of "
+                         f"${receipt['budget_usd']:g}"
+                         if receipt.get("budget_used_pct") is not None else "")),
+        ("tokens", f"{total:,}"),
+        ("subagents", str(receipt["subagent_spawns"])),
+        ("duration", f"{receipt['duration_s']}s"),
+        ("exit code", str(receipt["exit_code"])),
+        ("enforced", _md_cell(", ".join(receipt.get("enforced") or []) or "nothing")),
+    ]
+    if receipt.get("burn_rate_usd_per_min") is not None:
+        rows.insert(4, ("rate", f"${receipt['burn_rate_usd_per_min']:.4f}/min"))
+    out = ["### shortleash receipt", "", "| | |", "|---|---|"]
+    out += [f"| {k} | {v} |" for k, v in rows]
+    for w in receipt.get("warnings") or []:
+        out.append(f"\n> warning: {_md_cell(w)}")
+    return "\n".join(out) + "\n\n"
+
+
+def append_markdown(receipt: dict, path: str) -> None:
+    """Append the Markdown receipt to ``path`` (appended, not replaced, so
+    one file -- such as $GITHUB_STEP_SUMMARY -- can collect several runs)."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(format_markdown(_sanitize(receipt)))

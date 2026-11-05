@@ -746,12 +746,13 @@ class TestTheReadmeTellsTheTruth(unittest.TestCase):
         self.assertIn("bounded queue (4 MB)", readme)  # the code's own limit
 
     def test_the_model_limit_is_stated_and_true(self):
-        # L-7: the README says the model comes from system/init only ...
+        # L-7 (changed in 0.2.0): the README says each message is priced at
+        # the model it names, the session's model otherwise ...
         limits = _readme_section("Scope / limits")
-        self.assertIn("`system`/`init` event only", limits)
+        self.assertIn("priced at the model it names", limits)
         self.assertIn("total_cost_usd", limits)
-        # ... and it is so: a different model named on an assistant event is
-        # not read, everything is priced at the init model's rate
+        # ... and it is so: a message naming another model than system/init
+        # (a subagent on a dearer one) is priced at its own rate
         init = json.dumps({"type": "system", "subtype": "init",
                            "model": "claude-haiku-4-5", "session_id": "s"})
         msg = json.dumps({"type": "assistant", "message": {
@@ -767,7 +768,8 @@ class TestTheReadmeTellsTheTruth(unittest.TestCase):
         with open(g.receipt_path, encoding="utf-8") as f:
             rec = json.load(f)
         self.assertEqual(rec["model"], "claude-haiku-4-5")
-        self.assertAlmostEqual(rec["cost_usd"], 0.80)  # haiku, not opus's 15
+        self.assertAlmostEqual(rec["cost_usd"], 15.0)  # opus's rate, not haiku's
+        self.assertEqual(list(rec["models"]), ["claude-opus-4-1"])
 
 
 class TestTheFleetExampleAndTtl(unittest.TestCase):

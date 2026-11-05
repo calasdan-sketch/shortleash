@@ -1,13 +1,57 @@
 # ShortLeash — stop runaway agents
 
+**A circuit breaker for Claude Code: it kills a run that overspends, loops or
+stalls, asks a human before spending past a threshold, and leaves a receipt
+for every run.** Zero dependencies, Python 3.10+, Linux / macOS / Windows.
+
 A circuit breaker for AI coding-agent runs. Wraps an agent command, tails its
 telemetry in real time, and **kills the run the moment it breaches a guardrail**
-— budget, subagent-spawn cap, token cap, or wall-clock timeout. Emits a
-per-run receipt showing what it cost and why it stopped. "The moment" needs
-an agent that streams its usage; an agent that only reports at the end can be
-checked, but no longer stopped (see *Live, or only afterwards*).
+— budget, subagent-spawn cap, token cap, loop cap, idle (stuck) timeout or
+wall-clock timeout. Emits a per-run receipt showing what it cost and why it
+stopped. "The moment" needs an agent that streams its usage; an agent that
+only reports at the end can be checked, but no longer stopped (see *Live, or
+only afterwards*). For **interactive** Claude Code sessions the same caps,
+the loop guard and an approval gate run as a hook (see *Interactive sessions*).
 
-Vendors' "budgets" only warn while the meter keeps running. This one halts.
+```console
+$ shortleash run --budget 2 --ask-over 1 --max-repeats 4 --idle-timeout 300 -- \
+    claude -p "fix the flaky test"
+[shortleash] guarding: claude
+[shortleash] budget=$2 max_repeats=4 idle_timeout=300s ask_over=$1
+[shortleash] 50% of budget used: $1.0012 of $2 after 4m10s ($0.2402/min); at this rate the cap is reached in ~4m09s
+[shortleash] APPROVAL NEEDED: estimated $1.0012 > $1.00 approval threshold (--ask-over), after 4m10s. The agent is paused.
+[shortleash] Let it continue up to the $2.00 budget? [y/N] (no answer in 5m00s = stop) n
+...
+  STOPPED:   approval refused: estimated $1.0012 > $1.00 approval threshold (--ask-over); a human refused to let it continue
+```
+
+(An illustration of the output format; the figures are made up. Try it for
+free with the fake agent: `python3 -m shortleash run --budget 2 --max-repeats
+4 -- python3 sim/runaway.py` stops on a loop of identical `Task` calls.)
+
+## How it compares
+
+Only what the linked pages say, checked 2026-11-05; "no" means the linked
+page does not offer it.
+
+| | ShortLeash | Claude Code `--max-budget-usd` / `--max-turns` | AgentBudget | LiteLLM proxy budgets | Langfuse / AgentOps |
+|---|---|---|---|---|---|
+| stops a run when it overspends | yes, kills the process tree | yes (`-p` only) — runs overshot a $0.03 cap by ~7% on average in [one test](https://mer.vin/news/what-max-budget-usd-actually-kills-mid-agent-loop/) | yes, raises before the next LLM call ([PyPI](https://pypi.org/project/agentbudget/)) | yes, rejects requests over budget ([docs](https://docs.litellm.ai/docs/proxy/users)) | no: tracking and alerts ([Langfuse spend alerts](https://langfuse.com/docs/administration/spend-alerts) cover Langfuse's own bill) |
+| needs code changes / a server | no: wraps the command, or a hook | no | yes: in-process SDK patch | yes: a proxy and Postgres | yes: SDK + service |
+| loop detection | yes, stops (`--max-repeats`) | no | yes (`max_repeated_calls`) | no | AgentOps detects loops ([ag2 blog](https://docs.ag2.ai/latest/docs/blog/2024/07/25/AgentOps/)); does not stop them |
+| stuck (no output) timeout | yes (`--idle-timeout`) | no | no | no | no |
+| human approval past a threshold | yes: pauses the agent and asks (`--ask-over`), or Claude Code's prompt in hook mode | no | soft-limit callback only | no | no |
+| interactive Claude Code sessions | yes, as a PreToolUse hook | n/a (flags are for `-p`) | no | only if Claude Code is pointed at the proxy | no |
+| subagent spawn cap | yes | budget counts subagents | no | no | no |
+| per-run receipt | JSON + Markdown (GitHub job summary) | the final `result` event | a report object | spend logs in the DB | traces |
+
+## Why
+
+A coding agent that loops (re-running the same failing command), stalls, or
+fans out into subagents keeps spending until someone notices. Observability
+tools tell you afterwards; provider budgets are per account, not per task.
+ShortLeash is one command around one task: caps it, watches it, stops it, and
+writes down what happened.
 
 ## Install
 
@@ -35,9 +79,112 @@ shortleash run --budget 2.00 --max-spawns 10 -- \
 
 # All guardrails:
 shortleash run --budget 5.00 --max-spawns 10 --max-tokens 500000 \
-  --timeout 600 --receipt ./receipt.json -- \
+  --max-repeats 4 --idle-timeout 600 --timeout 3600 \
+  --ask-over 3.00 --receipt ./receipt.json -- \
   claude -p "migrate the database layer"
+
+# In CI: a receipt in the job summary
+shortleash run --budget 2 --receipt-md "$GITHUB_STEP_SUMMARY" -- claude -p "..."
 ```
+
+### Loops and stalls (`--max-repeats`, `--idle-timeout`)
+
+`--max-repeats N` stops a run whose agent makes **the same tool call N times
+in a row** — same tool, same input — or repeats the same cycle of two or
+three calls N times (`Read a.py, Bash pytest, Read a.py, Bash pytest, …`).
+Calls with different inputs never form a loop, so a healthy edit-then-test
+cycle is not flagged however long it runs: each edit is different. `N` is at
+least 2; 3 to 5 is a sensible start. The reason names the tool and a short
+hash of its input (`loop detected: the same Bash call (input 3fa2c1d0) was
+made 4 times in a row`), never the input itself, which may hold a secret.
+Like the spawn cap, it needs per-message events (`max_repeats` is listed
+under `not_enforced` and the exit code is `125` without them).
+
+`--idle-timeout SECONDS` stops a run that has printed nothing for that long
+(`stuck: no output from the agent for 600s`). It does not depend on the
+agent's telemetry, like `--timeout`. Claude Code prints an event when a
+message completes, not while a tool runs: set it above your longest single
+tool run (a full build, a test suite), or it will stop a healthy run.
+
+### Approval gate (`--ask-over USD`)
+
+Past `--ask-over` (an estimated spend below `--budget`), the leash **pauses
+the agent's whole process tree** (SIGSTOP to its process group), asks on
+your terminal whether it may continue up to `--budget`, and waits
+`--ask-timeout` seconds (default 300). `y` resumes it; anything else, no
+answer in time, no terminal to ask on (CI, a service, a background job) or a
+platform that cannot pause the tree (Windows) **stops the run**: the gate
+fails closed. It asks once per run. The receipt carries `approval`:
+`{"threshold_usd", "cost_at_ask_usd", "answer", "waited_s"}`. The wall-clock
+`--timeout` keeps counting while it waits (and still kills a paused agent);
+`--idle-timeout` does not. `--ask-over` must be below `--budget` (exit `2`
+otherwise).
+
+### Spend forecast (`--warn-at`)
+
+With `--budget`, the leash prints one line when the live estimate crosses
+50% and 80% of it: what is spent, the rate, and when the cap will be
+reached at that rate. `--warn-at 0.25,0.5,0.9` picks other fractions,
+`--warn-at off` none; `--quiet` silences it. The receipt carries
+`burn_rate_usd_per_min` and `budget_used_pct` — the numbers to size the
+next run's caps by.
+
+### Markdown receipt (`--receipt-md PATH`)
+
+Appends the receipt as a Markdown table to PATH — appended, not replaced, so
+`--receipt-md "$GITHUB_STEP_SUMMARY"` puts it in a GitHub Actions job
+summary and several runs can share one file. The command and the prompt are
+left out (a summary is shown to everyone who can see the job), and text from
+the agent is escaped (no HTML, no links). A path that cannot be written is
+refused before the agent starts (exit `2`).
+
+## Interactive sessions (`shortleash hook`)
+
+An interactive Claude Code session has no stream to wrap, but it runs
+**hooks**: before each tool call it starts a command, gives it the event as
+JSON, and lets it allow, deny or escalate the call to you. `shortleash hook`
+is that command:
+
+```bash
+shortleash hook install --budget 10 --ask-over 6 --max-repeats 4 --max-spawns 8
+# prints the settings block; to merge it into a settings file instead:
+shortleash hook install --budget 10 --ask-over 6 --max-repeats 4 \
+  --write .claude/settings.json      # the old file is kept as .bak
+```
+
+On each tool call it reads the session's transcript (the
+`transcript_path` Claude Code passes, plus the subagent transcripts next to
+it), counts the spend per model with the same pricing table, and:
+
+| condition | what Claude Code is told |
+|---|---|
+| over `--budget` or `--max-tokens` | `deny` and `continue: false` — Claude stops; you can still talk to it, and every further tool call is denied |
+| the call would be subagent number `--max-spawns` + 1 | `deny` that spawn, with the reason |
+| the call repeats a loop (`--max-repeats`) | `deny` it, with the reason, so Claude can change course |
+| over `--ask-over` | `ask` — **Claude Code's own permission prompt asks you** about each further call |
+| otherwise | nothing: no output, the normal permission rules apply |
+
+Every deny and ask is a line in `hook-log.jsonl` in the state directory
+(`~/.shortleash` or `$SHORTLEASH_HOME`): time, session, tool name, decision,
+reason, cost, tokens — never the tool's input. Input it cannot use (not
+JSON, no `transcript_path`, a bad `--pricing` file) is reported and the call
+goes ahead (exit `1`, a non-blocking hook error), unless you add
+`--fail-closed` (exit `2`: the call is blocked).
+
+Honest limits of hook mode: a hook runs at tool calls only, so a cap is
+enforced at the **next tool call** after it is crossed, not mid-answer, and a
+turn without tool calls is never stopped. Claude Code writes the transcript
+asynchronously, so the newest message may not be counted yet. Transcripts
+are re-read on every call (about 0.25 s for a 13 MB session here). The
+transcript layout (assistant lines with `message.id`/`model`/`usage`,
+subagents under `<session>/subagents/`) was checked against Claude Code
+2.1.318 on 2026-11-05; it is not a documented format. Recent transcripts
+also hold `cost-state` lines with Claude Code's own `totalCostUSD`
+(undocumented too): when present, the **larger** of that figure and the
+estimate is enforced, never the smaller. The `ask` and `deny` outputs follow
+the [hooks reference](https://code.claude.com/docs/en/hooks); whether `ask`
+prompts in every permission mode (`bypassPermissions`, say) was not tested
+here.
 
 Only the caps you set are enforced; the banner lists them (or says
 `no caps set`). `--timeout` must be greater than zero, and `--budget`,
@@ -264,7 +411,7 @@ Every run ends with a receipt on stderr and optionally as JSON
   tokens:    51,000 (in=15,000 out=4,500 cache_r=30,000 cache_w=1,500)
   turns:     0   spawns: 1
   duration:  0.16s   exit: 124
-  pricing:   built-in fallback table as of 2026-10-16 — verify against provider pricing
+  pricing:   built-in fallback table as of 2026-11-05 — verify against provider pricing
   STOPPED:   budget exceeded: estimated $0.1271 > $0.05 cap
 ──────────────────────────────────────────────────
 ```
@@ -305,7 +452,7 @@ recognised. The history file never stores command text.
 
 The built-in table (`pricing.py`, USD per 1M tokens) is **not fetched from
 anywhere**; it was written on the date in `PRICING_AS_OF`. The startup banner
-says so (`pricing: built-in fallback table as of 2026-10-16 — verify against
+says so (`pricing: built-in fallback table as of 2026-11-05 — verify against
 provider pricing`; not under `--quiet`), the receipt on stderr repeats that
 line whenever the cost it shows is an estimate, and the JSON receipt always
 carries it (`pricing`: `as_of`, `source`). Check it against the provider's
@@ -314,13 +461,22 @@ pricing page before trusting a `--budget` to the cent, and override it with
 pointing at a JSON file:
 
 ```json
-{"as_of": "2026-10-16",
- "sonnet": [3.0, 15.0], "opus": [15.0, 75.0], "haiku": [0.8, 4.0]}
+{"as_of": "2026-11-05",
+ "sonnet-5-5": [2.0, 10.0, 0.05], "opus-4-5": [5.0, 25.0], "my-model": [1, 4]}
 ```
 
 `as_of` is optional metadata echoed in the receipt; every other key is a
 case-insensitive substring matched against the model name, mapped to
-`[input, output]` dollars per 1M tokens. The entries of your file are tried
+`[input, output]` dollars per 1M tokens, or `[input, output,
+cache_read_factor]` for a model whose cache reads are not 10% of its input
+rate. The built-in table was copied from
+[Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing)
+on 2026-11-05 and names each model version (Opus 5.5 at $4 / $20 with
+cache reads at 0.05×, Opus 4.5 at $5 / $25, Opus 4.1 at $15 / $75, …);
+cache writes are priced at the 5-minute rate (1.25×), so a 1-hour cache
+write (2×) is under-estimated until the agent's own `total_cost_usd`
+replaces the estimate at the end. Haiku 5.5 is priced at its higher (long
+prompt) tier. The entries of your file are tried
 first and the built-in table after them; within each, the **longest**
 matching key wins, so `{"opus-4-5": [5, 25]}` prices `claude-opus-4-5` at
 5 / 25 while other opus models keep the built-in rate (before 0.1.1 the
@@ -517,20 +673,26 @@ returns and kills the whole tree, sends the leash itself Ctrl-C and SIGTERM
 at a temp dir). The Windows shim resolution and the cmd.exe refusal list
 are unit-tested with a fake shim directory on every platform.
 
-## Scope / limits (v0.1.3)
+## Scope / limits (v0.2.0)
 
-- Claude Code `-p` (non-interactive) is the supported path. Interactive
-  sessions and other agents (Codex, Cursor) are on the roadmap — the
-  event parser is isolated in `events.py` for exactly this.
+- `shortleash run` supports Claude Code `-p` (non-interactive); interactive
+  Claude Code sessions are covered by `shortleash hook`, which enforces at
+  tool calls, not mid-answer (see *Interactive sessions*). Other agents
+  (Codex, Cursor) are on the roadmap — the event parser is isolated in
+  `events.py` for exactly this.
+- **Loop detection is exact-match.** The same call with a trivially
+  different input (a changed timestamp, another line range) is not a repeat;
+  `--max-repeats` catches literal retries and short cycles, not every way an
+  agent can go round in circles.
 - Cost mid-run is an estimate; treat `--budget` as a guardrail, not accounting.
-- **The model is read from the stream's `system`/`init` event only.** Every
-  live estimate is priced at that model's rate, even if a later `assistant`
-  event names another model (a subagent on a dearer one, say), so a cost cap
-  can trip later (or earlier) than the real spend warrants; the agent's own
-  `total_cost_usd` replaces the estimate when the run completes and is
-  compared with the caps then. Whether a real Claude Code stream ever names a
-  different model that way has not been verified here: the behaviour was
-  only seen on a stream made up for the test.
+- **Each message is priced at the model it names** (`message.model`), the
+  `system`/`init` model when it names none — so a subagent on a dearer model
+  is priced at its own rate (the receipt's `models` lists the live estimate
+  per model). Before 0.2.0 everything was priced at the init model's rate.
+  It is still an estimate: the agent's own `total_cost_usd` replaces it when
+  the run completes and is compared with the caps then. Real Claude Code
+  transcripts were seen to name the model on every message (2.1.318); the
+  stream-json events are assumed to carry the same `message`.
 - **Live enforcement needs per-message events.** An agent that reports only
   a final `result` can be checked after it has finished, not stopped (see
   *Live, or only afterwards*). Whether the real `claude` CLI's
@@ -554,6 +716,11 @@ are unit-tested with a fake shim directory on every platform.
   covered by tests that run on Windows too (the suite passed there on Python
   3.11 for 0.1.2), but they were developed on Linux: no file written by a real
   PowerShell 5 was read.
+- **What 0.2.0 was run on:** Linux only, Python 3.13 (the new tests;
+  the CI matrix covers the rest). The hook was run against a real Claude
+  Code 2.1.318 transcript; `run` was not run against a real `claude`. The
+  approval gate's terminal prompt was exercised through a stand-in (no
+  terminal in the test machine); pausing the tree was checked on Linux.
 - **What 0.1.3 was run on:** Linux only, Python 3.10 to 3.14 (and pytest on
   3.11). Not on Windows or macOS, and not against a real `claude`. Agent names
   in other letter cases are tested by name (and with a script really called

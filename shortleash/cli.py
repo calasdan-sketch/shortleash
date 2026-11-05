@@ -14,6 +14,7 @@ Subcommands:
 
 import argparse
 import errno
+import json
 import atexit
 import math
 import os
@@ -22,6 +23,7 @@ import sys
 from . import cacheopt
 from . import fleet as fleet_mod
 from . import guard as guard_mod
+from . import hook as hook_mod
 from . import pricing
 from . import __version__
 
@@ -59,6 +61,29 @@ def _add_run_parser(sub) -> None:
     r.add_argument("--timeout", type=float, default=None,
                    help="Max wall-clock seconds before the run is killed "
                         "(a finite number > 0).")
+    r.add_argument("--max-repeats", type=int, default=None, metavar="N",
+                   help="Loop cap: kill the run when the same tool call "
+                        "(same tool, same input) -- or the same cycle of up "
+                        "to 3 calls -- is repeated N times in a row "
+                        "(N >= 2).")
+    r.add_argument("--idle-timeout", type=float, default=None,
+                   metavar="SECONDS",
+                   help="Stuck cap: kill the run when the agent prints "
+                        "nothing for this many seconds (set it above your "
+                        "longest single tool run).")
+    r.add_argument("--ask-over", type=float, default=None, metavar="USD",
+                   help="Approval gate: past this estimated spend the agent "
+                        "is paused and you are asked on the terminal whether "
+                        "it may continue (up to --budget). No terminal or no "
+                        "answer = stop. POSIX only; on Windows the run stops.")
+    r.add_argument("--ask-timeout", type=float,
+                   default=guard_mod.DEFAULT_ASK_TIMEOUT, metavar="SECONDS",
+                   help="How long the approval gate waits for an answer "
+                        f"(default {guard_mod.DEFAULT_ASK_TIMEOUT:g}).")
+    r.add_argument("--warn-at", type=_fractions, default=None,
+                   metavar="F[,F...]",
+                   help="Fractions of --budget at which to print a one-line "
+                        "spend forecast (default 0.5,0.8; 'off' for none).")
     r.add_argument("--grace-period", type=float, default=5.0,
                    help="Seconds between SIGTERM and SIGKILL on breach "
                         "(POSIX; Windows force-kills the tree at once), "
@@ -71,6 +96,10 @@ def _add_run_parser(sub) -> None:
                         "against provider pricing.")
     r.add_argument("--receipt", type=str, default=None,
                    help="Write the per-run receipt JSON to this path.")
+    r.add_argument("--receipt-md", type=str, default=None, metavar="PATH",
+                   help="Append the receipt as Markdown to this file, e.g. "
+                        "\"$GITHUB_STEP_SUMMARY\" for a GitHub Actions job "
+                        "summary. The command and prompt are left out.")
     r.add_argument("--redact-prompt", action="store_true",
                    help="Replace the prompt (the argument after -p/--print/"
                         "--prompt) with <redacted> in the receipt. Prompts "
@@ -117,10 +146,65 @@ def _add_run_parser(sub) -> None:
                    help="Command to run, after -- : shortleash run --budget 2 -- claude -p ...")
 
 
+def _fractions(text: str) -> tuple:
+    """'0.5,0.8' -> (0.5, 0.8); 'off' -> (). Each strictly between 0 and 1."""
+    if text.strip().lower() in ("off", "none", ""):
+        return ()
+    out = []
+    for part in text.split(","):
+        try:
+            f = float(part)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"not a number: {part.strip()!r}") from None
+        if not (math.isfinite(f) and 0 < f < 1):
+            raise argparse.ArgumentTypeError(
+                f"each fraction must be between 0 and 1 (got {part.strip()})")
+        out.append(f)
+    return tuple(sorted(set(out)))
+
+
 def _add_fleet_parser(sub) -> None:
     f = sub.add_parser("fleet", help="Fleet claims held on this machine.")
     fsub = f.add_subparsers(dest="fleet_cmd", required=True)
     fsub.add_parser("list", help="Show who currently holds which path.")
+
+
+def _add_hook_caps(p) -> None:
+    p.add_argument("--budget", type=float, default=None,
+                   help="Hard cap in USD for the session: past it every tool "
+                        "call is denied and Claude is stopped.")
+    p.add_argument("--ask-over", type=float, default=None, metavar="USD",
+                   help="Approval gate: past this spend each tool call needs "
+                        "a human's OK in Claude Code's permission prompt.")
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="Hard cap on the session's total tokens.")
+    p.add_argument("--max-spawns", type=int, default=None,
+                   help="Deny a subagent spawn past this many in the session.")
+    p.add_argument("--max-repeats", type=int, default=None, metavar="N",
+                   help="Deny a tool call that would repeat the same call (or "
+                        "cycle of up to 3) N times in a row (N >= 2).")
+    p.add_argument("--pricing", type=str, default=None,
+                   help="JSON file overriding the fallback pricing table.")
+    p.add_argument("--fail-closed", action="store_true",
+                   help="Block the tool call when the hook input or the "
+                        "pricing file cannot be read (default: let it "
+                        "through and report the error).")
+
+
+def _add_hook_parser(sub) -> None:
+    h = sub.add_parser(
+        "hook", help="Claude Code PreToolUse hook: caps, loop guard and an "
+                     "approval gate for interactive sessions.")
+    _add_hook_caps(h)
+    hsub = h.add_subparsers(dest="hook_cmd")
+    i = hsub.add_parser("install", help="Print (or --write) the Claude Code "
+                                        "settings that run the hook.")
+    _add_hook_caps(i)
+    i.add_argument("--write", metavar="SETTINGS_JSON", default=None,
+                   help="Merge the hook into this settings file (e.g. "
+                        ".claude/settings.json); the old file is kept as "
+                        ".bak.")
 
 
 def _add_cache_parser(sub) -> None:
@@ -156,6 +240,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
     _add_run_parser(sub)
     _add_fleet_parser(sub)
+    _add_hook_parser(sub)
     _add_cache_parser(sub)
     return p
 
@@ -264,6 +349,50 @@ def _cmd_fleet(args) -> int:
     return 0
 
 
+def _check_hook_caps(parser, args) -> None:
+    for flag, value in (("--budget", args.budget),
+                        ("--ask-over", args.ask_over)):
+        if value is not None and not (math.isfinite(value) and value >= 0):
+            parser.error(f"{flag} must be a finite number >= 0 (got {value:g})")
+    for flag, value in (("--max-tokens", args.max_tokens),
+                        ("--max-spawns", args.max_spawns)):
+        if value is not None and value < 0:
+            parser.error(f"{flag} must be >= 0 (got {value})")
+    if args.max_repeats is not None and args.max_repeats < 2:
+        parser.error(f"--max-repeats must be >= 2 (got {args.max_repeats})")
+    if (args.ask_over is not None and args.budget is not None
+            and args.ask_over >= args.budget):
+        parser.error(f"--ask-over (${args.ask_over:g}) must be below "
+                     f"--budget (${args.budget:g}): past the budget every "
+                     f"call is denied, so there is nothing left to approve")
+
+
+def _cmd_hook_install(args) -> int:
+    if all(v is None for v in (args.budget, args.ask_over, args.max_tokens,
+                               args.max_spawns, args.max_repeats)):
+        print("shortleash: error: give at least one cap (--budget, "
+              "--ask-over, --max-tokens, --max-spawns, --max-repeats)",
+              file=sys.stderr)
+        return 2
+    command = hook_mod.hook_command(args)
+    if args.write:
+        try:
+            backup = hook_mod.write_settings(args.write, command)
+        except (OSError, ValueError) as e:
+            print(f"shortleash: error: {e}", file=sys.stderr)
+            return 2
+        print(f"hook written to {args.write}"
+              + (f" (previous file kept as {backup})" if backup else ""))
+        print(f"  command: {command}")
+        print("Restart Claude Code (or run /hooks) for it to take effect.")
+        return 0
+    print("# Add this to .claude/settings.json (project) or "
+          "~/.claude/settings.json (all projects),")
+    print("# or run this command again with --write .claude/settings.json")
+    print(json.dumps(hook_mod.settings_block(command), indent=2))
+    return 0
+
+
 def _fleet_db() -> str:
     return fleet_mod.DB_PATH or fleet_mod.paths.fleet_db_path()
 
@@ -279,6 +408,12 @@ def _caps_banner(args) -> str:
         caps.append(f"max_tokens={args.max_tokens}")
     if args.timeout is not None:
         caps.append(f"timeout={args.timeout:g}s")
+    if args.max_repeats is not None:
+        caps.append(f"max_repeats={args.max_repeats}")
+    if args.idle_timeout is not None:
+        caps.append(f"idle_timeout={args.idle_timeout:g}s")
+    if args.ask_over is not None:
+        caps.append(f"ask_over=${args.ask_over:g}")
     if args.anomaly is not None:
         caps.append(f"anomaly={args.anomaly:g}x (needs {args.min_history} runs)")
     return " ".join(caps) if caps else "no caps set (nothing will be enforced)"
@@ -342,6 +477,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "cache":
         return _print_command(_cmd_cache, args)
+    if args.cmd == "hook":
+        _check_hook_caps(parser, args)
+        if args.hook_cmd == "install":
+            return _print_command(_cmd_hook_install, args)
+        return hook_mod.run_hook(args)
     if args.cmd == "fleet":
         return _print_command(_cmd_fleet, args)
     if args.cmd == "run":
@@ -351,6 +491,9 @@ def main(argv: list[str] | None = None) -> int:
         for flag, value in (("--budget", args.budget),
                             ("--timeout", args.timeout),
                             ("--grace-period", args.grace_period),
+                            ("--idle-timeout", args.idle_timeout),
+                            ("--ask-over", args.ask_over),
+                            ("--ask-timeout", args.ask_timeout),
                             ("--anomaly", args.anomaly)):
             if value is not None and not math.isfinite(value):
                 parser.error(f"{flag} must be a finite number (got {value:g})")
@@ -365,6 +508,23 @@ def main(argv: list[str] | None = None) -> int:
         # A zero timeout would trip the instant the child starts.
         if args.timeout is not None and args.timeout <= 0:
             parser.error(f"--timeout must be > 0 seconds (got {args.timeout:g})")
+        if args.ask_over is not None and args.ask_over < 0:
+            parser.error(f"--ask-over must be >= 0 (got {args.ask_over:g})")
+        if args.ask_timeout <= 0:
+            parser.error(f"--ask-timeout must be > 0 seconds "
+                         f"(got {args.ask_timeout:g})")
+        if (args.ask_over is not None and args.budget is not None
+                and args.ask_over >= args.budget):
+            parser.error(f"--ask-over (${args.ask_over:g}) must be below "
+                         f"--budget (${args.budget:g}): the budget would stop "
+                         f"the run before anyone was asked")
+        if args.idle_timeout is not None and args.idle_timeout <= 0:
+            parser.error(f"--idle-timeout must be > 0 seconds "
+                         f"(got {args.idle_timeout:g})")
+        # One call is no loop: a cap of 1 would stop every run at its
+        # first repeated read.
+        if args.max_repeats is not None and args.max_repeats < 2:
+            parser.error(f"--max-repeats must be >= 2 (got {args.max_repeats})")
         if args.anomaly is not None and args.anomaly <= 0:
             parser.error(f"--anomaly must be > 0 (got {args.anomaly:g})")
         # The baseline is the median of the past runs: there is none to take
@@ -411,6 +571,13 @@ def main(argv: list[str] | None = None) -> int:
             history_path=args.history_path,
             min_history=args.min_history,
             redact_prompt=args.redact_prompt,
+            max_repeats=args.max_repeats,
+            idle_timeout=args.idle_timeout,
+            warn_at=(guard_mod.DEFAULT_WARN_AT if args.warn_at is None
+                     else args.warn_at),
+            receipt_md=args.receipt_md,
+            ask_over=args.ask_over,
+            ask_timeout=args.ask_timeout,
         )
         if not args.quiet:
             # Never echo the full argv: it may contain secrets. Show only

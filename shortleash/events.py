@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import json
 
+from . import loops
+
 #: tool_use block names that mean "a subagent was spawned".
 SPAWN_TOOL_NAMES = frozenset({"Agent", "Task"})
 
@@ -82,6 +84,20 @@ def _spawn_blocks(message: dict) -> list[str]:
     return ids
 
 
+def _tool_calls(message: dict) -> list[tuple[str, str]]:
+    """(block id, fingerprint) of every tool_use block in a message, in
+    order. The fingerprint is the tool's name and its input (see
+    loops.fingerprint); loop detection compares them. A block without an
+    id gets a synthetic one per position, as for spawns."""
+    out: list[tuple[str, str]] = []
+    for i, block in enumerate((message or {}).get("content") or []):
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            out.append((str(block.get("id") or f"<no-id>#{i}"),
+                        loops.fingerprint(block.get("name"),
+                                          block.get("input"))))
+    return out
+
+
 def _count_spawns(message: dict) -> int:
     """Count subagent spawns (`Agent`/`Task` tool_use blocks) in a message."""
     return len(_spawn_blocks(message))
@@ -118,6 +134,10 @@ def parse_line(line: str) -> dict | None:
             "usage_unreadable": unreadable_usage(message.get("usage")),
             "spawns": len(spawn_ids),
             "spawn_ids": spawn_ids,
+            # The model that produced THIS message (a subagent may run on
+            # another one than the session's): "" when the event names none.
+            "model": str(message.get("model") or ""),
+            "tool_calls": _tool_calls(message),
         }
 
     if etype == "result":
