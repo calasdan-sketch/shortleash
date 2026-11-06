@@ -67,6 +67,7 @@ import time
 from . import events
 from . import history as history_mod
 from . import launch
+from . import loops
 from . import pricing
 from . import proctree
 from . import receipt as receipt_mod
@@ -107,6 +108,14 @@ ANOMALY_HINT_AFTER = ("flagged by anomaly mode only after the run ended, so "
                       "NAME for a separate baseline")
 
 _EXE_SUFFIXES = (".exe", ".cmd", ".bat", ".com", ".ps1")
+#: Fractions of --budget at which the leash prints a one-line forecast.
+DEFAULT_WARN_AT = (0.5, 0.8)
+#: Most distinct models priced separately in one run.
+MAX_MODELS = 32
+#: Seconds the approval gate waits for an answer before it stops the run.
+DEFAULT_ASK_TIMEOUT = 300.0
+#: How many tool_use block ids to remember for de-duplication.
+_CALL_WINDOW = 4096
 #: How many message ids to remember for usage de-duplication. The split
 #: events of one message are consecutive, so a small window is plenty.
 _MESSAGE_WINDOW = 256
@@ -237,6 +246,67 @@ def _say(text: str) -> None:
         pass
 
 
+def ask_on_terminal(text: str, timeout: float, cancelled) -> str | None:
+    """Ask yes/no on the controlling terminal -- not stdin and stdout, which
+    may be pipes. "yes", "no", "timeout", or None when there is no terminal
+    (CI, a service, Windows). Gives up early when ``cancelled()``."""
+    if os.name == "nt":
+        return None
+    try:
+        import select
+        tty = open("/dev/tty", "r+", encoding="utf-8", errors="replace")
+    except (OSError, ImportError):
+        return None
+    with tty:
+        try:
+            # A leash running as a background job (`shortleash run … &`)
+            # would be stopped by SIGTTIN/SIGTTOU the moment it used the
+            # terminal: only the foreground job may ask.
+            if os.tcgetpgrp(tty.fileno()) != os.getpgrp():
+                return None
+        except OSError:
+            return None
+        try:
+            tty.write(text)
+            tty.flush()
+        except OSError:
+            return None
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancelled():
+                return "no"
+            left = deadline - time.monotonic()
+            if left <= 0:
+                try:
+                    tty.write("\n")
+                    tty.flush()
+                except OSError:
+                    pass
+                return "timeout"
+            try:
+                ready, _, _ = select.select([tty], [], [], min(0.2, left))
+            except (OSError, ValueError):
+                return None
+            if ready:
+                line = tty.readline()
+                if not line:
+                    return None  # the terminal went away
+                return ("yes" if line.strip().lower() in ("y", "yes")
+                        else "no")
+
+
+def _fmt_secs(s: float) -> str:
+    """12s, 3m05s, 2h04m: short and readable on one line."""
+    if not math.isfinite(s) or s < 0:
+        return "?"
+    s = int(round(s))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
 def agent_name(argv0: str) -> str:
     """Basename of the agent binary in lower case, without a Windows
     executable suffix ('C:\\tools\\Claude.CMD' -> 'claude'), so history
@@ -267,8 +337,38 @@ class Guard:
         history_path: str | None = None,
         min_history: int = history_mod.MIN_HISTORY,
         redact_prompt: bool = False,
+        max_repeats: int | None = None,
+        idle_timeout: float | None = None,
+        warn_at: tuple = DEFAULT_WARN_AT,
+        receipt_md: str | None = None,
+        ask_over: float | None = None,
+        ask_timeout: float = DEFAULT_ASK_TIMEOUT,
+        ask_fn=None,
     ):
         self.budget = budget
+        self.max_repeats = max_repeats
+        self.idle_timeout = idle_timeout
+        # Fractions of --budget at which a one-line forecast is printed.
+        self.warn_at = tuple(sorted(f for f in (warn_at or ()) if 0 < f < 1))
+        self._warned_at: set = set()
+        self.receipt_md = receipt_md
+        # The approval gate: past ask_over the tree is paused and a human
+        # is asked whether the run may go on (up to --budget).
+        self.ask_over = ask_over
+        self.ask_timeout = ask_timeout
+        self._ask = ask_fn or ask_on_terminal
+        self._paused = False
+        self.approval: dict | None = None  # receipt "approval" field
+        # Tool calls in order (fingerprints, see loops), for --max-repeats.
+        # [call id, fingerprint, result digest or None], oldest first
+        self._calls: collections.deque[list] = collections.deque(
+            maxlen=loops.HISTORY)
+        self._seen_calls: collections.OrderedDict[str, None] = \
+            collections.OrderedDict()
+        # model -> usage counted for messages of that model (per-message
+        # pricing: a subagent on a dearer model is priced at its own rate)
+        self._usage_by_model: dict[str, dict] = {}
+        self._last_output = 0.0  # monotonic time of the agent's last line
         self.max_spawns = max_spawns
         self.max_tokens = max_tokens
         self.timeout = timeout
@@ -331,21 +431,38 @@ class Guard:
         # can never drive totals down and blind the caps.
         with self._lock:
             u = {k: max(0, obs["usage"].get(k, 0)) for k in self.usage}
+            u["cache_write_1h"] = max(0, obs["usage"].get("cache_write_1h", 0))
             mid = obs.get("message_id") or ""
-            if mid and mid in self._seen_messages:
+            prev = self._seen_messages.get(mid) if mid else None
+            model = str(obs.get("model") or self.model)[:200]
+            # (a model with a long-prompt tier is priced per request: the
+            # first copy of a message decides, its later copies follow)
+            model = prev["__key"] if prev else pricing.price_key(model, u)
+            if (model not in self._usage_by_model
+                    and len(self._usage_by_model) >= MAX_MODELS):
+                # a child naming a new model on every message must not grow
+                # this without bound: the rest is priced at the session's
+                model = self.model
+            per_model = self._usage_by_model.setdefault(
+                model, {k: 0 for k in u})
+            if prev is not None:
                 # Same API response, next content block: usage repeats.
                 # Count only growth (output tokens can still rise), never
                 # the same tokens twice.
-                prev = self._seen_messages[mid]
-                for k in self.usage:
-                    self.usage[k] += max(0, u[k] - prev[k])
+                for k in u:
+                    grow = max(0, u[k] - prev[k])
+                    if k in self.usage:
+                        self.usage[k] += grow
+                    per_model[k] += grow
                     prev[k] = max(prev[k], u[k])
                 self._seen_messages.move_to_end(mid)
             else:
-                for k in self.usage:
-                    self.usage[k] += u[k]
+                for k in u:
+                    if k in self.usage:
+                        self.usage[k] += u[k]
+                    per_model[k] += u[k]
                 if mid:
-                    self._seen_messages[mid] = dict(u)
+                    self._seen_messages[mid] = dict(u, __key=model)
                     while len(self._seen_messages) > _MESSAGE_WINDOW:
                         self._seen_messages.popitem(last=False)
             spawn_ids = obs.get("spawn_ids")
@@ -357,16 +474,39 @@ class Guard:
                     if key not in self._seen_spawns:
                         self._seen_spawns.add(key)
                         self.spawns += 1
+            for cid, fp in obs.get("tool_calls") or ():
+                key = f"{mid}:{cid}" if cid.startswith("<no-id>") else cid
+                if key in self._seen_calls:
+                    continue  # the same block, re-emitted
+                self._seen_calls[key] = None
+                while len(self._seen_calls) > _CALL_WINDOW:
+                    self._seen_calls.popitem(last=False)
+                self._calls.append([key, fp, None])
             if not obs.get("usage_unreadable"):
                 # (an event whose usage block the leash cannot read is not
                 # usage telemetry: it must not make a token cap look live)
                 self.usage_events += 1
 
-    def estimated_cost(self) -> float:
+    def _add_results(self, results) -> None:
+        """Attach each tool result's digest to its call (loop detection
+        compares results too, when they are known)."""
         with self._lock:
-            usage = dict(self.usage)
-            model = self.model
-        return pricing.estimate_cost(model, usage, self.pricing_table)
+            for tid, digest in results:
+                for entry in reversed(self._calls):
+                    if entry[0] == tid:
+                        entry[2] = digest
+                        break
+
+    def _cost_by_model(self, by_model: dict) -> float:
+        return sum(pricing.estimate_cost(m, u, self.pricing_table)
+                   for m, u in by_model.items())
+
+    def estimated_cost(self) -> float:
+        """The live estimate: every message priced at its own model's rate
+        (the session's model when the message names none)."""
+        with self._lock:
+            by_model = {m: dict(u) for m, u in self._usage_by_model.items()}
+        return self._cost_by_model(by_model)
 
     def total_tokens(self) -> int:
         with self._lock:
@@ -384,6 +524,10 @@ class Guard:
         caps = []
         if self.budget is not None:
             caps.append("budget")
+        if self.max_repeats is not None:
+            caps.append("max_repeats")
+        if self.ask_over is not None:
+            caps.append("ask_over")
         if self.max_tokens is not None:
             caps.append("max_tokens")
         if self.max_spawns is not None:
@@ -403,7 +547,7 @@ class Guard:
             has_usage = self.reported_usage is not None
         if events:
             return "live"
-        if cap == "max_spawns":
+        if cap in ("max_spawns", "max_repeats", "ask_over"):
             return None  # only the per-message events list tool_use blocks
         if cap == "max_tokens":
             return "final" if has_usage else None
@@ -421,14 +565,20 @@ class Guard:
             reported_cost = self.reported_cost
             events = self.usage_events
             model = self.model
+            by_model = {m: dict(u) for m, u in self._usage_by_model.items()}
         usage = dict(live)
         if reported is not None:
             usage = {k: max(live[k], reported.get(k, 0)) for k in live}
+        # What the final report adds on top of the live count has no model
+        # attached: it is priced at the session's model.
+        extra = {k: usage[k] - live[k] for k in live}
+        live_cost = self._cost_by_model(by_model)
         have_data = events > 0 or reported_cost is not None or reported is not None
         if reported_cost is not None:
             cost: float | None = reported_cost
         elif have_data:
-            cost = pricing.estimate_cost(model, usage, self.pricing_table)
+            cost = live_cost + pricing.estimate_cost(model, extra,
+                                                     self.pricing_table)
         else:
             cost = None
         return {
@@ -436,7 +586,7 @@ class Guard:
             "tokens": sum(usage.values()),
             "cost": cost,
             "cost_reported": reported_cost is not None,
-            "live_cost": pricing.estimate_cost(model, live, self.pricing_table),
+            "live_cost": live_cost,
             "live_tokens": sum(live.values()),
             "usage_events": events,
         }
@@ -500,6 +650,12 @@ class Guard:
                 f"token cap exceeded: {self.total_tokens():,} "
                 f"> {self.max_tokens:,} max"
             )
+        if self.max_repeats is not None:
+            with self._lock:
+                calls = [(fp, res) for _, fp, res in self._calls]
+            block = loops.find_loop(calls, self.max_repeats)
+            if block:
+                return loops.describe(block, self.max_repeats)
         if self.anomaly is not None and self._baseline:
             b = self._baseline
             cost = self.estimated_cost()
@@ -574,6 +730,7 @@ class Guard:
     def _monitor_stdout(self) -> None:
         assert self.proc is not None and self.proc.stdout is not None
         for line in self.proc.stdout:
+            self._last_output = time.monotonic()
             # Hand the line to the echo thread first (it never waits), then
             # parse: nothing about our stdout may delay a cap check.
             pump = self._pump
@@ -613,9 +770,22 @@ class Guard:
             self._price_notice()
         elif kind == "usage":
             self._add_usage(obs)
+            if obs.get("model"):
+                self._price_notice(obs["model"])
             reason = self._check_caps()
             if reason:
                 self._trip(reason)
+            else:
+                self._forecast()
+                if (self.ask_over is not None and self.approval is None
+                        and self.estimated_cost() > self.ask_over):
+                    self._gate()
+        elif kind == "tool_results":
+            self._add_results(obs["results"])
+            if self.max_repeats is not None:
+                reason = self._check_caps()
+                if reason:
+                    self._trip(reason)
         elif kind == "result":
             cost = None
             if obs.get("cost_usd") is not None:
@@ -653,19 +823,106 @@ class Guard:
                 self.warnings.append(note)
 
     def _watchdog(self) -> None:
-        if self.timeout is None:
+        """--timeout (wall clock) and --idle-timeout (no output line for
+        that long): both enforced from here, whatever the agent reports."""
+        if self.timeout is None and self.idle_timeout is None:
             return
-        deadline = self.started_at + self.timeout
+        deadline = (None if self.timeout is None
+                    else self.started_at + self.timeout)
+        tick = min(0.5, self.idle_timeout / 4) if self.idle_timeout else 0.5
         while True:
             proc = self.proc
-            if proc is None or proc.poll() is not None:
+            if proc is None or proc.poll() is not None or self.breached:
                 return
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
                 self._trip(
                     f"time limit exceeded: {self.timeout:.0f}s wall clock"
                 )
                 return
-            time.sleep(0.5)
+            if self.idle_timeout is not None and not self._paused:
+                quiet = now - max(self._last_output, self.started_at)
+                if quiet >= self.idle_timeout:
+                    self._trip(
+                        f"stuck: no output from the agent for "
+                        f"{quiet:.0f}s (--idle-timeout {self.idle_timeout:g}s)")
+                    return
+            time.sleep(tick)
+
+    # -- approval gate ----------------------------------------------------
+
+    def _gate(self) -> None:
+        """The live estimate crossed --ask-over: pause the agent's whole
+        tree, ask a human, and either let it run on (up to --budget) or stop
+        it. No terminal, no answer in time, or a platform that cannot pause
+        the tree: the run is stopped -- the gate fails closed."""
+        cost = self.estimated_cost()
+        what = (f"estimated ${cost:.4f} > ${self.ask_over:.2f} approval "
+                f"threshold (--ask-over)")
+        self.approval = {"threshold_usd": self.ask_over,
+                         "cost_at_ask_usd": round(cost, 6),
+                         "answer": None, "waited_s": 0.0}
+        if not proctree.can_pause():
+            self.approval["answer"] = "unavailable"
+            self._trip(f"approval needed: {what}; this platform cannot pause "
+                       f"the agent while asking, so the run was stopped")
+            return
+        if not proctree.pause_tree(self.proc):
+            return  # the group is gone: the run is ending anyway
+        self._paused = True
+        asked = time.monotonic()
+        cap = (f"up to the ${self.budget:.2f} budget" if self.budget is not None
+               else "with no budget cap")
+        text = (f"\n[shortleash] APPROVAL NEEDED: {what}, after "
+                f"{_fmt_secs(asked - self.started_at)}. The agent is paused.\n"
+                f"[shortleash] Let it continue {cap}? [y/N] "
+                f"(no answer in {_fmt_secs(self.ask_timeout)} = stop) ")
+        try:
+            answer = self._ask(text, self.ask_timeout, lambda: self.breached)
+        except Exception as e:  # a broken prompt must not leave it paused
+            answer = None
+            self.warnings.append(f"the approval prompt failed: "
+                                 f"{type(e).__name__}: {e}")
+        self.approval["waited_s"] = round(time.monotonic() - asked, 2)
+        self.approval["answer"] = answer or "no terminal"
+        if self.breached:
+            return  # stopped meanwhile (timeout, signal): already killed
+        if answer == "yes":
+            self._last_output = time.monotonic()
+            self._paused = False
+            proctree.resume_tree(self.proc)
+            _say(f"[shortleash] approved: continuing {cap}\n")
+            return
+        if answer == "no":
+            why = "a human refused to let it continue"
+        elif answer == "timeout":
+            why = f"no answer within {_fmt_secs(self.ask_timeout)}"
+        else:
+            why = "there was no terminal to ask on (the gate fails closed)"
+        self._trip(f"approval refused: {what}; {why}")
+
+    # -- forecast -------------------------------------------------------
+
+    def _forecast(self) -> None:
+        """Print one line the first time the live estimate crosses each
+        --warn-at fraction of --budget: what is spent, how fast, and when
+        the cap will be reached at this rate."""
+        if self.budget is None or self.budget <= 0 or self.quiet:
+            return
+        cost = self.estimated_cost()
+        crossed = [f for f in self.warn_at
+                   if cost >= f * self.budget and f not in self._warned_at]
+        if not crossed:
+            return
+        self._warned_at.update(crossed)
+        elapsed = max(1e-6, time.monotonic() - self.started_at)
+        rate = cost / elapsed * 60.0
+        left = self.budget - cost
+        eta = (f"at this rate the cap is reached in ~{_fmt_secs(left / rate * 60.0)}"
+               if rate > 0 else "no spend rate yet")
+        _say(f"[shortleash] {max(crossed):.0%} of budget used: "
+             f"${cost:.4f} of ${self.budget:g} after {_fmt_secs(elapsed)} "
+             f"(${rate:.4f}/min); {eta}\n")
 
     # -- escaped children ---------------------------------------------
 
@@ -914,6 +1171,11 @@ class Guard:
                     f"past runs recorded for "
                     f"{self.profile or self.agent or 'this agent'}) — only "
                     f"the static caps apply to this run")
+        stale = pricing.stale_note(self.pricing_table.as_of)
+        if stale:
+            self.warnings.append(stale)
+            if not self.quiet:
+                _say(f"[shortleash] warning: {stale}\n")
         self.proc = None
         self.job = None
         # Resolve the executable ourselves (PATHEXT shims on Windows) and
@@ -935,6 +1197,13 @@ class Guard:
                     f"shortleash: error: cannot write the receipt to "
                     f"{self.receipt_path}: {e.strerror or e}\n")
                 sys.stderr.flush()
+                return 2
+        if self.receipt_md:
+            try:
+                receipt_mod.prepare_receipt_path(self.receipt_md)
+            except OSError as e:
+                _say(f"shortleash: error: cannot write the markdown receipt "
+                     f"to {self.receipt_md}: {e.strerror or e}\n")
                 return 2
         # The handlers are installed BEFORE the agent exists and stay
         # installed until the receipt is written and the run recorded: a
@@ -999,16 +1268,23 @@ class Guard:
         finally:
             self._restore_handlers(previous)
 
+    def _unpriced_models(self) -> list[str]:
+        """Models that usage was counted for but no table entry names."""
+        with self._lock:
+            models = [m for m, u in self._usage_by_model.items()
+                      if any(u.values())]
+        return [m for m in models
+                if pricing.match(m, self.pricing_table)[0] == "default"]
+
     def price_assumed(self) -> bool:
         """True when the live estimate behind the caps had to assume a
-        rate: usage was priced, but no entry of the table names this model."""
-        with self._lock:
-            priced = self.usage_events > 0
-            model = self.model
-        return priced and pricing.match(model, self.pricing_table)[0] == "default"
+        rate: usage was priced, but no entry of the table names its model."""
+        return bool(self._unpriced_models())
 
-    def _price_assumption_text(self) -> str:
-        model = self.model
+    def _price_assumption_text(self, model: str | None = None) -> str:
+        if model is None:
+            unpriced = self._unpriced_models()
+            model = unpriced[0] if unpriced else self.model
         rate = pricing.match(model, self.pricing_table)[1]
         who = f"model {model!r}" if model else "the model (the agent did not name one)"
         return (f"{who} is not in the pricing table: the estimate behind "
@@ -1016,14 +1292,16 @@ class Guard:
                 f"${rate[0]:g} / ${rate[1]:g} per 1M tokens in / out -- "
                 f"check it, or add the model with --pricing FILE")
 
-    def _price_notice(self) -> None:
-        """Say once, as soon as the model is known, that its price is a
+    def _price_notice(self, model: str | None = None) -> None:
+        """Say once, as soon as a model is known, that its price is a
         guess (the receipt repeats it)."""
         if self._price_notice_shown or self.quiet:
             return
-        if pricing.match(self.model, self.pricing_table)[0] == "default":
+        model = self.model if model is None else model
+        if pricing.match(model, self.pricing_table)[0] == "default":
             self._price_notice_shown = True
-            _say(f"[shortleash] warning: {self._price_assumption_text()}\n")
+            _say(f"[shortleash] warning: "
+                 f"{self._price_assumption_text(model)}\n")
 
     def _drain_echo(self) -> None:
         """Let the echo thread write out what is queued, but never wait
@@ -1090,16 +1368,18 @@ class Guard:
         telemetry = self.telemetry_seen
         requested = self.telemetry_caps()
         basis = {cap: self.cap_basis(cap) for cap in requested}
-        enforced = (["timeout"] if self.timeout is not None else []) + [
+        enforced = (["timeout"] if self.timeout is not None else []) + (
+            ["idle_timeout"] if self.idle_timeout is not None else []) + [
             cap for cap in requested if basis[cap]]
         not_enforced = [cap for cap in requested if not basis[cap]]
         # Could the cap have stopped the run while it ran? The wall-clock
         # limit always could; a telemetry cap only with per-message events.
-        enforced_live = {cap: cap == "timeout" or basis.get(cap) == "live"
-                         for cap in enforced}
+        enforced_live = {cap: cap in ("timeout", "idle_timeout")
+                         or basis.get(cap) == "live" for cap in enforced}
         assumed = self.price_assumed()
         if assumed:
-            self.warnings.append(self._price_assumption_text())
+            for m in self._unpriced_models():
+                self.warnings.append(self._price_assumption_text(m))
         after_only = [cap for cap in requested if basis[cap] == "final"]
         if after_only and not self.breached:
             self.warnings.append(
@@ -1167,6 +1447,9 @@ class Guard:
             hint=hint,
             child_returncode=child_returncode,
             anomaly_armed=self._anomaly_armed,
+            models=self._model_breakdown(),
+            budget=self.budget,
+            approval=self.approval,
         )
         show = not self.quiet
         # Learn from every run that produced telemetry (breached runs are
@@ -1198,6 +1481,25 @@ class Guard:
                 rec["warnings"].append(note)
                 _say(f"shortleash: warning: {note}\n")
                 show = True
+        if self.receipt_md:
+            try:
+                receipt_mod.append_markdown(rec, self.receipt_md)
+            except OSError as e:
+                note = (f"markdown receipt could not be written to "
+                        f"{self.receipt_md}: {e.strerror or e}")
+                self.warnings.append(note)
+                rec["warnings"].append(note)
+                _say(f"shortleash: warning: {note}\n")
         if show:
             _say(receipt_mod.format_human(rec) + "\n")
         return exit_code
+
+    def _model_breakdown(self) -> dict:
+        """{model: {"tokens", "cost_usd"}} of the live count, per model."""
+        with self._lock:
+            by_model = {m: dict(u) for m, u in self._usage_by_model.items()}
+        return {(m or "?"): {
+                    "tokens": sum(u[k] for k in events.USAGE_KEYS),
+                    "cost_usd": round(pricing.estimate_cost(
+                        m, u, self.pricing_table), 6)}
+                for m, u in by_model.items() if any(u.values())}

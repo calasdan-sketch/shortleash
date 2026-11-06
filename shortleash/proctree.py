@@ -164,6 +164,9 @@ def _kill_tree_posix(proc: subprocess.Popen, grace: float,
     pgid = proc.pid  # start_new_session=True => pgid == pid
     if not _signal_group(pgid, signal.SIGTERM):
         return 0  # group already empty: nothing escaped
+    # A stopped process (paused at an approval prompt, or Ctrl-Z'd) only
+    # acts on SIGTERM once it runs again: wake the group so it can.
+    _signal_group(pgid, signal.SIGCONT)
     deadline = time.monotonic() + max(0.0, grace)
     while time.monotonic() < deadline:
         if not child_exited:
@@ -173,6 +176,24 @@ def _kill_tree_posix(proc: subprocess.Popen, grace: float,
         time.sleep(0.05)
     _signal_group(pgid, signal.SIGKILL)
     return 1
+
+
+def can_pause() -> bool:
+    """Can the agent's tree be paused (SIGSTOP / SIGCONT to its group)?"""
+    return not is_windows() and hasattr(signal, "SIGSTOP")
+
+
+def pause_tree(proc: subprocess.Popen) -> bool:
+    """Stop every process of the agent's group (POSIX). True on success."""
+    if not can_pause():
+        return False
+    return _signal_group(proc.pid, signal.SIGSTOP)
+
+
+def resume_tree(proc: subprocess.Popen) -> bool:
+    if not can_pause():
+        return False
+    return _signal_group(proc.pid, signal.SIGCONT)
 
 
 # -- Windows Job Objects --------------------------------------------------

@@ -30,6 +30,10 @@ os.environ["USERPROFILE"] = TEST_HOME
 # `run` reads $SHORTLEASH_PRICING when --pricing is not given: a pricing file
 # in the developer's own shell (or a broken one) must not change what a test sees.
 os.environ.pop("SHORTLEASH_PRICING", None)
+# The built-in table's as_of date ages with the calendar: a test must not
+# start seeing a "prices are N days old" warning one day. Tests of that
+# warning pass today= or set the variable themselves.
+os.environ["SHORTLEASH_STALE_DAYS"] = "0"
 
 
 def _default_signals():

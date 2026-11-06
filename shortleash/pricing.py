@@ -15,7 +15,7 @@ prefers the agent-reported total_cost_usd when present.
 
 Pricing JSON format (USD per 1M tokens, [input, output]):
 
-    {"as_of": "2026-10-16",
+    {"as_of": "2026-11-05",
      "sonnet": [3.0, 15.0], "opus": [15.0, 75.0], "haiku": [0.8, 4.0]}
 
 "as_of" is optional metadata and is echoed in the receipt; every other
@@ -37,24 +37,100 @@ from . import textfile
 
 #: Date the hard-coded table below was written. Nothing updates it
 #: automatically: when you change a number, change this too.
-PRICING_AS_OF = "2026-10-16"
+PRICING_AS_OF = "2026-11-05"
 
 #: Environment variable naming a pricing JSON file (used when --pricing
 #: is not given).
 PRICING_ENV = "SHORTLEASH_PRICING"
 
-# USD per 1M tokens. (input, output). Cache read ~10% of input, cache
-# write ~1.25x input — standard Anthropic cache pricing shape.
-# Fallback estimates as of PRICING_AS_OF — verify against provider pricing.
+# USD per 1M tokens: (input, output) or (input, output, cache_read_factor)
+# when a model's cache reads are not the usual 10% of input. Cache writes
+# are priced at 1.25x input (5-minute cache) and, when the usage block says
+# how many went to the 1-hour cache, those at 2x.
+# Copied from https://platform.claude.com/docs/en/about-claude/pricing on
+# PRICING_AS_OF. The generic keys ("opus", "sonnet", "haiku") only price a
+# model none of the specific keys names; they keep their older, higher
+# rates so an unknown model is not priced low. Haiku 5.5 has two tiers by
+# prompt length: a request whose prompt (input + cache reads + cache writes)
+# exceeds 100K tokens is priced at "haiku-5-5#long" (see price_key).
 DEFAULT_PRICING = {
+    "fable-5-1": (10.00, 50.00, 0.025),
+    "mythos-5-1": (10.00, 50.00, 0.025),
+    "fable": (10.00, 50.00),
+    "mythos": (10.00, 50.00),
+    "opus-5-5": (4.00, 20.00, 0.05),
+    "opus-5": (5.00, 25.00),
+    "opus-4-8": (5.00, 25.00),
+    "opus-4-7": (5.00, 25.00),
+    "opus-4-6": (5.00, 25.00),
+    "opus-4-5": (5.00, 25.00),
+    "opus-4-1": (15.00, 75.00),
+    "opus-4": (15.00, 75.00),
     "opus": (15.00, 75.00),
+    "sonnet-5-5": (2.00, 10.00, 0.05),
+    "sonnet-5": (2.00, 10.00),
+    "sonnet-4": (3.00, 15.00),
     "sonnet": (3.00, 15.00),
+    "haiku-5-5#long": (0.50, 2.50),
+    "haiku-5-5": (0.10, 0.50),
+    "haiku-4-5": (1.00, 5.00),
+    "haiku-3-5": (0.80, 4.00),
     "haiku": (0.80, 4.00),
     "default": (3.00, 15.00),
 }
 
 CACHE_READ_FACTOR = 0.10
 CACHE_WRITE_FACTOR = 1.25
+CACHE_WRITE_1H_FACTOR = 2.0
+
+#: Models billed by prompt length: key -> prompt tokens above which a
+#: request is priced at "<key>#long".
+LONG_PROMPT_TIERS = {"haiku-5-5": 100_000}
+
+#: A built-in or file table older than this many days is called stale.
+STALE_AFTER_DAYS = 60
+#: Environment variable overriding STALE_AFTER_DAYS (0 switches it off).
+STALE_ENV = "SHORTLEASH_STALE_DAYS"
+
+
+def price_key(model: str, usage: dict) -> str:
+    """The name ONE request is priced under: the model, or "<model>#long"
+    when the model has a long-prompt tier and this request's prompt
+    (input + cache reads + cache writes) exceeds it."""
+    m = (model or "").lower()
+    for key, limit in LONG_PROMPT_TIERS.items():
+        if key in m:
+            prompt = (usage.get("input", 0) + usage.get("cache_read", 0)
+                      + usage.get("cache_write", 0))
+            if prompt > limit:
+                return f"{model}#long"
+    return model
+
+
+def stale_note(as_of: str, today=None) -> str | None:
+    """A warning when the table's as_of date is more than STALE_AFTER_DAYS
+    old (or cannot be read as a date), else None."""
+    import datetime
+    limit = STALE_AFTER_DAYS
+    raw = os.environ.get(STALE_ENV, "").strip()
+    if raw:
+        try:
+            limit = int(raw)
+        except ValueError:
+            pass
+    if limit <= 0:
+        return None  # switched off
+    today = today or datetime.date.today()
+    try:
+        when = datetime.date.fromisoformat(str(as_of)[:10])
+    except ValueError:
+        return None  # "unknown (no as_of in file)": already says so
+    age = (today - when).days
+    if age > limit:
+        return (f"the pricing table is {age} days old (as of {as_of}): "
+                f"prices may have changed -- check them, or pass --pricing "
+                f"FILE with current ones")
+    return None
 
 #: Keys in a pricing JSON file that are metadata, not model rates.
 _META_KEYS = {"as_of"}
@@ -94,15 +170,16 @@ def _parse_rates(data: dict, pricing: dict, where: str,
             if key == "as_of":
                 as_of = str(v)
             continue
-        if (not isinstance(v, (list, tuple)) or len(v) != 2
-                or isinstance(v[0], (bool, str)) or isinstance(v[1], (bool, str))):
+        if (not isinstance(v, (list, tuple)) or len(v) not in (2, 3)
+                or any(isinstance(x, (bool, str)) for x in v)):
             raise ValueError(
-                f"{where}: {k!r} must be [input_per_1M, output_per_1M], got {v!r}")
+                f"{where}: {k!r} must be [input_per_1M, output_per_1M] or "
+                f"[input_per_1M, output_per_1M, cache_read_factor], got {v!r}")
         if not key.strip():
             raise ValueError(f"{where}: a model key must not be empty "
                              f"(it would match every model)")
         try:
-            rate = (float(v[0]), float(v[1]))
+            rate = tuple(float(x) for x in v)
         except (TypeError, ValueError, OverflowError):
             rate = (math.nan, math.nan)
         if not all(math.isfinite(x) and x >= 0 for x in rate):
@@ -178,14 +255,18 @@ def estimate_cost(model: str, usage: dict, pricing=None) -> float:
 
     ``pricing`` may be a rates dict or a PricingTable.
     """
-    in_rate, out_rate = match(model, pricing)[1]
+    rate = match(model, pricing)[1]
+    in_rate, out_rate = rate[0], rate[1]
+    read_factor = rate[2] if len(rate) > 2 else CACHE_READ_FACTOR
     u = usage
     try:
         tokens = (
             u.get("input", 0) * in_rate
             + u.get("output", 0) * out_rate
-            + u.get("cache_read", 0) * in_rate * CACHE_READ_FACTOR
+            + u.get("cache_read", 0) * in_rate * read_factor
             + u.get("cache_write", 0) * in_rate * CACHE_WRITE_FACTOR
+            + u.get("cache_write_1h", 0) * in_rate
+            * (CACHE_WRITE_1H_FACTOR - CACHE_WRITE_FACTOR)
         )
     except OverflowError:
         # A count too large for a float: the cost is "more than anything",
