@@ -5,3 +5,4 @@ graft tests
 graft sim
 # `graft` takes whatever lies in the directory, test-run caches included.
 global-exclude *.py[cod]
+recursive-include bench *.py

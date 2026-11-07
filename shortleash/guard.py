@@ -64,9 +64,11 @@ import sys
 import threading
 import time
 
+from . import chain as chain_mod
 from . import events
 from . import history as history_mod
 from . import launch
+from . import ledger
 from . import loops
 from . import pricing
 from . import proctree
@@ -344,8 +346,32 @@ class Guard:
         ask_over: float | None = None,
         ask_timeout: float = DEFAULT_ASK_TIMEOUT,
         ask_fn=None,
+        daily_budget: float | None = None,
+        project_daily_budget: float | None = None,
+        max_errors: int | None = None,
+        loop_fuzzy: bool = False,
+        ledger_project: str = "",
+        ledger_id: str | None = None,
+        chain_path: str | None = None,
+        chain_key: bytes | None = None,
     ):
         self.budget = budget
+        self.chain_path = chain_path
+        self.chain_key = chain_key
+        self._sentinel = None
+        # --daily-budget / --project-daily-budget: caps over the spend of
+        # every run and session on the machine, from the shared ledger.
+        self.daily_budget = daily_budget
+        self.project_daily_budget = project_daily_budget
+        self.ledger_project = ledger_project
+        self.ledger_id = ledger_id or f"run-{os.getpid()}-{time.time_ns()}"
+        self._ledger_others = {"day": 0.0, "project": 0.0}
+        self._ledger_checked = 0.0   # monotonic time of the last refresh
+        self._ledger_failed = False
+        self.ledger_info: dict | None = None  # receipt "ledger" field
+        self.max_errors = max_errors
+        self.loop_fuzzy = loop_fuzzy
+        self._err_streak = 0
         self.max_repeats = max_repeats
         self.idle_timeout = idle_timeout
         # Fractions of --budget at which a one-line forecast is printed.
@@ -526,6 +552,12 @@ class Guard:
             caps.append("budget")
         if self.max_repeats is not None:
             caps.append("max_repeats")
+        if self.max_errors is not None:
+            caps.append("max_errors")
+        if self.daily_budget is not None:
+            caps.append("daily_budget")
+        if self.project_daily_budget is not None:
+            caps.append("project_daily_budget")
         if self.ask_over is not None:
             caps.append("ask_over")
         if self.max_tokens is not None:
@@ -547,7 +579,8 @@ class Guard:
             has_usage = self.reported_usage is not None
         if events:
             return "live"
-        if cap in ("max_spawns", "max_repeats", "ask_over"):
+        if cap in ("max_spawns", "max_repeats", "ask_over", "max_errors",
+                   "daily_budget", "project_daily_budget"):
             return None  # only the per-message events list tool_use blocks
         if cap == "max_tokens":
             return "final" if has_usage else None
@@ -640,6 +673,9 @@ class Guard:
                 f"budget exceeded: estimated ${self.estimated_cost():.4f} "
                 f"> ${self.budget:.2f} cap"
             )
+        reason = self._ledger_check()
+        if reason:
+            return reason
         if self.max_spawns is not None:
             with self._lock:
                 spawns = self.spawns
@@ -656,6 +692,13 @@ class Guard:
             block = loops.find_loop(calls, self.max_repeats)
             if block:
                 return loops.describe(block, self.max_repeats)
+        if self.max_errors is not None:
+            with self._lock:
+                streak = self._err_streak
+            if streak >= self.max_errors:
+                return (f"error streak: {streak} tool calls in a row failed "
+                        f"(limit {self.max_errors}); the agent is not "
+                        f"getting anywhere")
         if self.anomaly is not None and self._baseline:
             b = self._baseline
             cost = self.estimated_cost()
@@ -676,6 +719,51 @@ class Guard:
                 )
         return None
 
+    def _ledger_check(self) -> str | None:
+        """The machine-wide caps (--daily-budget, --project-daily-budget):
+        this run's cost is appended to the shared ledger and added to what
+        every other run and session spent today. The directory is re-read at
+        most once a second; in between, the last total of the others is
+        used with this run's live cost."""
+        if self.daily_budget is None and self.project_daily_budget is None:
+            return None
+        cost = self.estimated_cost()
+        now = time.monotonic()
+        if now - self._ledger_checked >= 1.0:
+            self._ledger_checked = now
+            try:
+                ledger.record(self.ledger_id, cost, self.ledger_project)
+                self._ledger_others["day"] = ledger.today_spend(
+                    exclude=self.ledger_id)
+                self._ledger_others["project"] = ledger.today_spend(
+                    project=self.ledger_project, exclude=self.ledger_id)
+            except OSError as e:
+                if not self._ledger_failed:
+                    self._ledger_failed = True
+                    with self._lock:
+                        self.warnings.append(
+                            f"the spend ledger could not be used mid-run "
+                            f"({e.strerror or e}): the daily caps use the "
+                            f"last totals read")
+        day = self._ledger_others["day"] + cost
+        proj = self._ledger_others["project"] + cost
+        self.ledger_info = {
+            "day_spend_usd": round(day, 6),
+            "project_spend_usd": round(proj, 6),
+            "daily_budget_usd": self.daily_budget,
+            "project_daily_budget_usd": self.project_daily_budget,
+        }
+        if self.daily_budget is not None and day > self.daily_budget:
+            return (f"daily budget exceeded: ${day:.4f} spent today by all "
+                    f"runs and sessions on this machine > "
+                    f"${self.daily_budget:.2f} cap (this run: ${cost:.4f})")
+        if (self.project_daily_budget is not None
+                and proj > self.project_daily_budget):
+            return (f"project daily budget exceeded: ${proj:.4f} spent today "
+                    f"in this project > ${self.project_daily_budget:.2f} cap "
+                    f"(this run: ${cost:.4f})")
+        return None
+
     def _trip(self, reason: str) -> None:
         with self._lock:
             if self.breached:
@@ -692,6 +780,17 @@ class Guard:
         if proc is None:
             return
         proctree.kill_tree(proc, grace=self.grace_period, job=self.job)
+        self._note_detached()
+
+    def _note_detached(self) -> None:
+        n = proctree.detached_killed
+        if n:
+            note = (f"{n} process(es) that had detached from the agent's "
+                    f"process group (own session) were found by ancestry "
+                    f"and killed with it")
+            with self._lock:
+                if note not in self.warnings:
+                    self.warnings.append(note)
 
     # -- monitor -----------------------------------------------------
 
@@ -746,7 +845,7 @@ class Guard:
                 # closed: the run is tripped immediately. Letting the
                 # exception escape would kill this thread and leave the
                 # supervisor blocked on proc.wait() forever.
-                obs = events.parse_line(line)
+                obs = events.parse_line(line, self.loop_fuzzy)
                 if obs is not None:
                     obs = self._handle_obs(obs)
             except Exception as e:
@@ -782,7 +881,10 @@ class Guard:
                     self._gate()
         elif kind == "tool_results":
             self._add_results(obs["results"])
-            if self.max_repeats is not None:
+            with self._lock:
+                for failed in obs.get("errors") or []:
+                    self._err_streak = self._err_streak + 1 if failed else 0
+            if self.max_repeats is not None or self.max_errors is not None:
                 reason = self._check_caps()
                 if reason:
                     self._trip(reason)
@@ -964,6 +1066,7 @@ class Guard:
                                         child_exited=True, job=self.job)
         finally:
             self._in_wait = False
+        self._note_detached()
         still_open = not self._join_monitor(monitor, self.grace_period)
         if still_open:
             self.warnings.append(
@@ -1198,6 +1301,13 @@ class Guard:
                     f"{self.receipt_path}: {e.strerror or e}\n")
                 sys.stderr.flush()
                 return 2
+        if self.chain_path:
+            try:
+                chain_mod.prepare(self.chain_path)
+            except OSError as e:
+                _say(f"shortleash: error: cannot extend the receipt chain "
+                     f"{self.chain_path}: {e.strerror or e}\n")
+                return 2
         if self.receipt_md:
             try:
                 receipt_mod.prepare_receipt_path(self.receipt_md)
@@ -1215,6 +1325,11 @@ class Guard:
         # that arrives before the first wait is only recorded (see
         # _wait_child) and acted on there.
         previous = self._install_handlers()
+        self._sentinel = None
+        proctree.set_subreaper()
+        # started before the agent: a process start takes a few ms that the
+        # agent's first lines should not wait for
+        self._sentinel = proctree.start_sentinel()
         try:
             try:
                 self.proc = subprocess.Popen(
@@ -1250,11 +1365,14 @@ class Guard:
             # whose parent already exited (None elsewhere, or if it could
             # not be set up -- then taskkill is the fallback).
             self.job = proctree.attach_job(self.proc)
+            proctree.note_agent(self.proc.pid)
             self._pump = _EchoPump(self._echo_line)
             monitor = threading.Thread(target=self._monitor_stdout, daemon=True)
             monitor.start()
             watchdog = threading.Thread(target=self._watchdog, daemon=True)
             watchdog.start()
+            if self._sentinel is not None:
+                self._sentinel.attach(self.proc.pid)
             try:
                 exit_code = self._wait_child()
                 self._reap_stragglers(monitor)
@@ -1266,6 +1384,10 @@ class Guard:
             self._finishing = True
             return self._finish(argv, wall_start, exit_code, monitor)
         finally:
+            if self._sentinel is not None:
+                self._sentinel.done()
+                self._sentinel = None
+            proctree.clear_subreaper()
             self._restore_handlers(previous)
 
     def _unpriced_models(self) -> list[str]:
@@ -1450,7 +1572,17 @@ class Guard:
             models=self._model_breakdown(),
             budget=self.budget,
             approval=self.approval,
+            ledger_info=self.ledger_info,
         )
+        if (self.daily_budget is not None
+                or self.project_daily_budget is not None):
+            # leave the true final figure in the ledger for the next run
+            try:
+                if rec.get("cost_usd") is not None:
+                    ledger.record(self.ledger_id, rec["cost_usd"],
+                                  self.ledger_project)
+            except OSError:
+                pass
         show = not self.quiet
         # Learn from every run that produced telemetry (breached runs are
         # excluded from baselines; telemetry-less runs say nothing about
@@ -1490,6 +1622,19 @@ class Guard:
                 self.warnings.append(note)
                 rec["warnings"].append(note)
                 _say(f"shortleash: warning: {note}\n")
+        if self.chain_path:
+            try:
+                head = chain_mod.append(self.chain_path,
+                                        receipt_mod._sanitize(rec),
+                                        self.chain_key)
+                _say(f"[shortleash] receipt chained; head {head}\n")
+            except (OSError, ValueError) as e:
+                note = (f"receipt could not be added to the chain "
+                        f"{self.chain_path}: {getattr(e, 'strerror', None) or e}")
+                self.warnings.append(note)
+                rec["warnings"].append(note)
+                _say(f"shortleash: warning: {note}\n")
+                show = True
         if show:
             _say(receipt_mod.format_human(rec) + "\n")
         return exit_code

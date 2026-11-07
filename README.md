@@ -1,8 +1,9 @@
 # ShortLeash — stop runaway agents
 
 **A circuit breaker for Claude Code: it kills a run that overspends, loops or
-stalls, asks a human before spending past a threshold, and leaves a receipt
-for every run.** Zero dependencies, Python 3.10+, Linux / macOS / Windows.
+stalls, caps what ALL your agents spend in a day, asks a human before spending
+past a threshold, and leaves a receipt for every run that an auditor can
+check.** Zero dependencies, Python 3.10+, Linux / macOS / Windows.
 
 A circuit breaker for AI coding-agent runs. Wraps an agent command, tails its
 telemetry in real time, and **kills the run the moment it breaches a guardrail**
@@ -31,19 +32,30 @@ free with the fake agent: `python3 -m shortleash run --budget 2 --max-repeats
 
 ## How it compares
 
-Only what the linked pages say, checked 2026-11-05; "no" means the linked
-page does not offer it.
+Only what the linked pages say (or what was run, where marked), checked
+2026-11-07; "no" means the page does not offer it.
 
-| | ShortLeash | Claude Code `--max-budget-usd` / `--max-turns` | AgentBudget | LiteLLM proxy budgets | Langfuse / AgentOps |
-|---|---|---|---|---|---|
-| stops a run when it overspends | yes, kills the process tree | yes (`-p` only) — runs overshot a $0.03 cap by ~7% on average in [one test](https://mer.vin/news/what-max-budget-usd-actually-kills-mid-agent-loop/) | yes, raises before the next LLM call ([PyPI](https://pypi.org/project/agentbudget/)) | yes, rejects requests over budget ([docs](https://docs.litellm.ai/docs/proxy/users)) | no: tracking and alerts ([Langfuse spend alerts](https://langfuse.com/docs/administration/spend-alerts) cover Langfuse's own bill) |
-| needs code changes / a server | no: wraps the command, or a hook | no | yes: in-process SDK patch | yes: a proxy and Postgres | yes: SDK + service |
-| loop detection | yes, stops (`--max-repeats`) | no | yes (`max_repeated_calls`) | no | AgentOps detects loops ([ag2 blog](https://docs.ag2.ai/latest/docs/blog/2024/07/25/AgentOps/)); does not stop them |
-| stuck (no output) timeout | yes (`--idle-timeout`) | no | no | no | no |
-| human approval past a threshold | yes: pauses the agent and asks (`--ask-over`), or Claude Code's prompt in hook mode | no | soft-limit callback only | no | no |
-| interactive Claude Code sessions | yes, as a PreToolUse hook | n/a (flags are for `-p`) | no | only if Claude Code is pointed at the proxy | no |
-| subagent spawn cap | yes | budget counts subagents | no | no | no |
-| per-run receipt | JSON + Markdown (GitHub job summary) | the final `result` event | a report object | spend logs in the DB | traces |
+| | ShortLeash | Claude Code `--max-budget-usd` | Anthropic spend limits | LiteLLM proxy budgets | AgentBudget | ccusage |
+|---|---|---|---|---|---|---|
+| stops a run that overspends | yes, kills the process tree | yes, `-p` only (`claude --help` 2.1.319: "only works with --print"; runs overshot a $0.03 cap by ~7% in [one test](https://mer.vin/news/what-max-budget-usd-actually-kills-mid-agent-loop/)) | yes, per month: requests then fail with HTTP 429 / 400 ([docs](https://platform.claude.com/docs/en/api/rate-limits)) | yes, rejects requests ([docs](https://docs.litellm.ai/docs/proxy/users)) | yes, raises before the next call ([PyPI](https://pypi.org/project/agentbudget/)) | no: reports only (ran v20.0.48: `daily`, `session`, `blocks` print usage; `blocks --token-limit` only warns) |
+| cap over ALL agents for a day / a project | yes: `--daily-budget`, `--project-daily-budget`, `run` and `hook` share one ledger | no | month only, per organization or workspace | yes, `budget_duration` windows such as `24h` per key / team (needs Postgres) | no | no |
+| interactive Claude Code sessions | yes, as a hook | no (`-p` only) | yes (account level) | only if Claude Code is pointed at the proxy | no | no (`statusline` shows cost) |
+| a session with no tool calls can be stopped | `--block-prompts` refuses the next prompt | n/a | n/a | n/a | n/a | n/a |
+| needs a server / code changes | no | no | no | yes: proxy + Postgres | yes: SDK in your code | no |
+| loop detection | yes, stops: exact, fuzzy (`--loop-fuzzy`) and error streaks (`--max-errors`) | no | no | `max_iterations` per agent session ([docs](https://docs.litellm.ai/docs/proxy/users)) | yes (`max_repeated_calls`) | no |
+| stuck (no output) timeout | yes | no | no | no | no | no |
+| human approval past a threshold | yes: pauses the agent and asks, or Claude Code's prompt in hook mode | no | no | no | soft-limit callback only | no |
+| kills what the agent detached (setsid, daemons) and survives `kill -9` of the supervisor | yes on Linux (sentinel + ancestry sweep, below) | n/a | n/a | n/a | n/a | n/a |
+| tamper-evident receipts | yes: hash chain, optional HMAC, `shortleash verify` | the final `result` event | n/a | spend logs in the DB | a report object | no |
+
+Not in the table because they are not the same kind of tool:
+[claude-code-router](https://github.com/musistudio/claude-code-router) routes
+requests and offers per-client request / token / image limits, and its page
+mentions no dollar budget or loop detection;
+[Portkey](https://portkey.ai/docs/product/ai-gateway/virtual-keys/budget-limits)
+has USD and token budgets with weekly / monthly resets, on its Enterprise plan
+and for select Pro customers; Langfuse and AgentOps track and alert.
+Helicone was not checked.
 
 ## Why
 
@@ -105,11 +117,28 @@ made 4 times in a row`), never the input itself, which may hold a secret.
 Like the spawn cap, it needs per-message events (`max_repeats` is listed
 under `not_enforced` and the exit code is `125` without them).
 
-It can be evaded, and says so: matching is exact, so the same call with a
-trivially different input (another timestamp, a shifted line range, a space
-in the middle) or a result that changes every time (a clock, a PID) is not a
-repeat. It catches literal retries and short cycles, not every way an agent
-can go round in circles.
+By default matching is exact, so the same call with a trivially different
+input (another timestamp, a shifted line range, a space in the middle) or a
+result that changes every time (a clock, a PID) is not a repeat. Two opt-in
+settings close most of that gap, and say what they cost:
+
+- `--loop-fuzzy` compares calls with white space runs and every number in
+  the input ignored, and results with timestamps, UUIDs, long hex ids,
+  durations (`3.2s`) and `pid N` ignored. Other digits in a result still
+  count, so "5 failed" then "4 failed" is progress, not a repeat. The cost:
+  a sweep such as `check.py --seed 1`, `--seed 2`, ... that prints the same
+  "ok" each time looks like a loop (the first false positive in
+  *Benchmarks*). Raise `N` or leave fuzzy off for such work.
+- `--max-errors N` stops the run after N tool calls **in a row** failed
+  (`is_error` on the tool result): an agent that varies its commands is not
+  repeating itself, but eight different `pip install` attempts that all fail
+  are not getting anywhere either. One successful call resets the count; in
+  hook mode each subagent has its own count. A tool call you refuse in
+  Claude Code's prompt is also an error result, so refusing six in a row trips
+  it. Like `--max-repeats` it needs per-message events.
+
+Even then it catches literal retries, near-literal ones and failure streaks,
+not every way an agent can go round in circles.
 
 `--idle-timeout SECONDS` stops a run that has printed nothing for that long
 (`stuck: no output from the agent for 600s`). It does not depend on the
@@ -149,6 +178,72 @@ left out (a summary is shown to everyone who can see the job), and text from
 the agent is escaped (no HTML, no links). A path that cannot be written is
 refused before the agent starts (exit `2`).
 
+### Day and project budgets (`--daily-budget`, `--project-daily-budget`)
+
+`--budget` caps one run. Ten sessions at $9 each stay under a $10 cap and
+still cost $90. The **spend ledger** adds caps over everything on the
+machine, for the local calendar day, shared by `run` and `hook`:
+
+```bash
+shortleash run --daily-budget 25 --project-daily-budget 10 -- claude -p "..."
+shortleash hook install --daily-budget 25 --project-daily-budget 10 \
+  --write .claude/settings.json
+```
+
+Every run and session appends its cumulative cost to its own file under
+`<state>/ledger/` (one short line per $0.005 of growth; nothing is ever
+rewritten, so concurrent agents cannot lose each other's writes and no lock
+is needed). Today's spend is the sum over those files; a session that crosses
+midnight is split between the days. `--project-daily-budget` counts only the
+same project: for `run`, the working directory; for `hook`, the directory
+Claude Code keeps the session's transcripts in (named after the project's
+path with every character that is not a letter or digit turned into `-`;
+that this matches for every path was not verified).
+
+Limits: the first line of a session carries everything it had spent before
+it was first seen, so a long session adopted by the hook today counts in full
+today (an over-count, the safe side); two agents can each pass the check just
+before the other's spend lands, so the cap can be overshot by about what the
+agents spend between two of their own checks (one tool call for the hook, a
+second for `run`); the cost is the same estimate as everywhere else; and a
+ledger that cannot be written is a usage error (`run` exits `2` before
+starting, the hook exits `2` with `--fail-closed` and `1` otherwise) rather
+than a cap that quietly does not hold. It is a guardrail against a runaway,
+not a defence against an agent that deletes the ledger. With only a final
+`result` and no per-message events the caps are `not_enforced` (exit `125`).
+The receipt carries `ledger` (`day_spend_usd`, `project_spend_usd` and the
+caps).
+
+### Receipts an auditor can verify (`--chain`, `shortleash verify`)
+
+```bash
+shortleash run --chain ~/receipts.jsonl --budget 2 -- claude -p "..."
+shortleash verify ~/receipts.jsonl
+# OK: 14 record(s), head 7837f7da... -- write the head down
+shortleash verify ~/receipts.jsonl --expect-head 7837f7da...
+```
+
+`--chain PATH` appends the (secret-scrubbed) receipt to a JSON-lines log in
+which each record holds the SHA-256 of the record before it. `verify` names
+the first record that was edited, removed, inserted or moved and exits `1`.
+What that does and does not prove:
+
+- Dropping the **last** records leaves a valid, shorter chain. Keep the head
+  hash that `run` prints and `verify` reports somewhere the log's writer
+  cannot reach, and pass it as `--expect-head`.
+- Hashes alone do not stop someone who can write the file from rewriting the
+  whole chain consistently. Put a secret in an environment variable that the
+  agent cannot read (`SHORTLEASH_CHAIN_KEY`, or any name via
+  `--chain-key-env` / `verify --key-env`; never on the command line) and each
+  record also carries an HMAC-SHA256: a chain rewritten without the key fails
+  `verify --key-env`. Whoever holds the key can forge.
+- The contents are only as true as the run's telemetry (see *Trust
+  boundary*); a record says what the leash saw, when the host's clock said so.
+- Concurrent runs extend one chain under a lock on `PATH.lock`. A chain whose
+  last line is cut short is not extended (`run` exits `2`; look at it with
+  `verify`). The lock is `flock` on POSIX and `msvcrt` on Windows (the
+  Windows path was not run).
+
 ## Interactive sessions (`shortleash hook`)
 
 An interactive Claude Code session has no stream to wrap, but it runs
@@ -174,6 +269,28 @@ it), counts the spend per model with the same pricing table, and:
 | the call repeats a loop (`--max-repeats`) | `deny` it, with the reason, so Claude can change course |
 | over `--ask-over` | `ask` — **Claude Code's own permission prompt asks you** about each further call |
 | otherwise | nothing: no output, the normal permission rules apply |
+
+**Fast hook.** Claude Code starts the hook as a new process before every
+tool call, and a session with many subagents can hold hundreds of MB of
+transcripts. The hook therefore keeps, under `<state>/hook-cache/`, the
+state after the bytes it has already read of each transcript (usage per
+model, subagent spawns, the recent calls) and reads only what was appended.
+A cache that is missing, corrupt, from another version, or for a file that was
+truncated or replaced is dropped and the file is read again from its start; the
+figures are the same as a full read (a test replays random growth and compares
+the two). `SHORTLEASH_NO_CACHE=1` switches it off. The cache is as
+trustworthy as the transcript: an agent that can edit files in your state
+directory can make the hook count less (the same is true of the transcript
+itself).
+
+**Prompts.** A hook runs at tool calls, so a session that only talks is never
+stopped by `PreToolUse`. `hook install --block-prompts` also registers the
+hook on `UserPromptSubmit`: a session over `--budget`, `--max-tokens`,
+`--daily-budget` or `--project-daily-budget` then has its next prompt
+refused (`{"decision": "block", "reason": ...}`, per the
+[hooks reference](https://code.claude.com/docs/en/hooks)). The prompt text is
+never logged. `--ask-over` and the loop caps do not block prompts. Not tried
+against a live Claude Code here.
 
 Every deny and ask is a line in `hook-log.jsonl` in the state directory
 (`~/.shortleash` or `$SHORTLEASH_HOME`): time, session, tool name, decision,
@@ -205,8 +322,8 @@ judged on the sequence of the agent the call belongs to (`agent_id`).
 Honest limits of hook mode: a hook runs at tool calls only, so a cap is
 enforced at the **next tool call** after it is crossed, not mid-answer, and a
 turn without tool calls is never stopped. Claude Code writes the transcript
-asynchronously, so the newest message may not be counted yet. Transcripts
-are re-read on every call (about 0.25 s for a 13 MB session here). The
+asynchronously, so the newest message may not be counted yet. Only what a
+transcript gained since the last call is read (see *Fast hook*). The
 transcript layout (assistant lines with `message.id`/`model`/`usage`,
 subagents under `<session>/subagents/`) was checked against Claude Code
 2.1.318 on 2026-11-05; it is not a documented format. Recent transcripts
@@ -403,6 +520,22 @@ in the instant between `CreateProcess` and the job assignment is not
 covered. If the job cannot be set up, the fallback is `taskkill /T /F` plus
 an orphan sweep by parent pid.
 
+**Processes that left the group (Linux).** A process group is not a
+container: a grandchild that calls `setsid()` (a daemon, `nohup setsid`)
+is out of a group kill's reach. On Linux the leash now (a) reads `/proc` at
+the moment of the kill and also kills the agent's descendants that are not in
+its group, by pid and start time so a recycled pid is never hit; (b) is a
+"child subreaper", so processes orphaned below the agent are adopted by the
+leash and swept too; and (c) starts a small **sentinel** process in its own
+session that holds the other end of a pipe: if the leash dies without
+saying it is done (`kill -9`, the OOM killer, a crash) the sentinel kills the
+agent's group and every descendant it has been tracking (it looks once a
+second). A daemon double-forked less than a second before the leash was
+killed with `kill -9` can still escape. Receipts warn when the sweep killed
+detached processes. `SHORTLEASH_NO_ESCAPE_SWEEP=1` switches all of it off.
+macOS gets only the sentinel's group kill (no `/proc`); it was not run there.
+`bench/bench_orphans.py` measures it (*Benchmarks*).
+
 Children that outlive the command are handled too. If the agent exits but
 leaves subprocesses running (which also keep its output pipe open), the
 leash waits one grace period for the pipe to close, then kills the
@@ -420,7 +553,7 @@ design; the receipt warns about it instead of waiting forever.
 | `1` | the process exited 0 but its final stream-json `result` said `is_error: true` (`FAILED:` in the receipt, e.g. "Not logged in") |
 | `128+N` | POSIX: the child was killed by signal N outside any breach (what a shell would report) |
 | `126` | the command was found but could not be started (a directory, no execute permission, not an executable file, a path through a file): one `shortleash: error: cannot start …` line and no receipt, as nothing ran. Before 0.1.1 this was a traceback and exit `1` |
-| `2` | usage error, command not found, unsafe `.cmd` launch refused, receipt path not writable, a pricing file that cannot be loaded, `fleet list` on a Python without `sqlite3` |
+| `2` | usage error, command not found, unsafe `.cmd` launch refused, receipt path not writable, a pricing file that cannot be loaded, a spend ledger (`--daily-budget`) or receipt chain (`--chain`) that cannot be used, `fleet list` on a Python without `sqlite3`; for `verify`: the key variable is unset |
 | other | the child's own exit code (on Windows its 32-bit status, clamped to 0–255; the raw value is `child_returncode` in the receipt) |
 
 The last row includes a command that itself exits `124`, `125`, `126` or
@@ -698,6 +831,51 @@ writes is plain UTF-8. A file in any other encoding, a file that cannot be
 read and an output path that cannot be written are each one `error:` line and
 exit `2`. (Before 0.1.2 the first and the last were a traceback and exit `1`.)
 
+## Benchmarks
+
+Three scripts under `bench/` anyone can re-run; each builds its own synthetic
+data in a temp directory (no real transcripts, no network, no API calls).
+Numbers below: one 2-core Linux VM, Python 3.13, 2026-11-07; yours will differ,
+the ratios should not.
+
+**Hook latency** (`python3 bench/bench_hook.py --mb 150 --agents 100`): the
+real `python -m shortleash hook` command, one process per tool call, on a
+synthetic 151 MB session of 101 transcripts, median of the calls after one
+more message was appended.
+
+| | 0.2.0 behaviour (`SHORTLEASH_NO_CACHE=1`) | 0.3.0 |
+|---|---|---|
+| 40 MB, 41 transcripts | 733 ms | 115 ms |
+| 151 MB, 101 transcripts | 2714 ms | 165 ms |
+
+The first call on a session (nothing cached yet) is not faster: 0.9 s and
+2.4 s here. (On a real Claude Code session of that shape the full read took
+5.7 s per call on the same machine, which is why this matters: the hook's
+default timeout is 600 s but `--fail-closed` installs a 60 s one.)
+
+**Processes left behind** (`python3 bench/bench_orphans.py`, Linux): a fake
+agent leaves three sleepers, one in its process group, one that called
+`setsid()`, one double-forked daemon. Survivors out of 3, sentinel and sweep
+off (the 0.2.0 behaviour) against on:
+
+| leash ends by | off | on |
+|---|---|---|
+| a `--budget` breach | 1 to 2 | 0 |
+| `kill -9` | 3 | 0 |
+| SIGTERM | 1 to 2 | 0 |
+
+**Stuck agents** (`python3 bench/bench_loops.py`): 8 stuck and 8 healthy
+tool-call traces written by the maintainers for this purpose (synthetic, and
+written knowing the fuzzy design: it measures the trade-off, it is not an
+independent dataset; add your own traces to `CORPUS`). `--max-repeats 4`
+throughout.
+
+| setting | stuck traces stopped | healthy traces stopped |
+|---|---|---|
+| exact (0.2.0) | 1 of 8 | 0 of 8 |
+| `--loop-fuzzy` | 6 of 8 | 1 of 8 (a seed sweep printing the same line) |
+| `--loop-fuzzy --max-errors 6` | 8 of 8 | 1 of 8 |
+
 ## Testing
 
 ```bash
@@ -718,17 +896,34 @@ returns and kills the whole tree, sends the leash itself Ctrl-C and SIGTERM
 at a temp dir). The Windows shim resolution and the cmd.exe refusal list
 are unit-tested with a fake shim directory on every platform.
 
-## Scope / limits (v0.2.0)
+## Scope / limits (v0.3.0)
 
+- **What 0.3.0 was run on:** Linux only, Python 3.13, 2 cores. The hook's
+  incremental tally was also checked against the figures of one real Claude
+  Code 2.1.319 session (the same totals as a full read); `claude -p` was not
+  run through `shortleash run`, `UserPromptSubmit` blocking was not tried in a
+  live Claude Code, and nothing new was run on macOS or Windows (the
+  `flock` / `msvcrt` chain lock and the sentinel are written for them).
+- **The estimate can fall short of what Claude Code bills.** On one real
+  session with 115 subagent transcripts, the sum of the transcripts, priced
+  with the built-in table, came to about 11% below the total Claude Code
+  recorded itself (`cost-state`), most of it usage that never reaches a
+  transcript (a small background model; cache-write splits). The hook enforces
+  the larger of the two, but `cost-state` lines are written only now and then,
+  so between them the estimate is what you get. The built-in prices matched
+  Claude Code's own per-model dollar figures to the cent for the two models
+  that had full usage in the transcripts. Treat every cap as a guardrail with
+  a margin.
 - `shortleash run` supports Claude Code `-p` (non-interactive); interactive
   Claude Code sessions are covered by `shortleash hook`, which enforces at
   tool calls, not mid-answer (see *Interactive sessions*). Other agents
   (Codex, Cursor) are on the roadmap — the event parser is isolated in
   `events.py` for exactly this.
-- **Loop detection is exact-match.** The same call with a trivially
-  different input (a changed timestamp, another line range) is not a repeat;
-  `--max-repeats` catches literal retries and short cycles, not every way an
-  agent can go round in circles.
+- **Loop detection is exact-match unless you ask.** `--loop-fuzzy` and
+  `--max-errors` (see *Loops and stalls*) catch more, at the price of some
+  false positives; none of it catches every way an agent can go round in
+  circles (a changed word in a prompt-like argument, a loop that makes
+  progress in output every time).
 - Cost mid-run is an estimate; treat `--budget` as a guardrail, not accounting.
 - **Each message is priced at the model it names** (`message.model`), the
   `system`/`init` model when it names none — so a subagent on a dearer model
@@ -745,9 +940,10 @@ are unit-tested with a fake shim directory on every platform.
 - **The agent's own report is the evidence.** The leash cannot see spend an
   agent hides or under-reports (see *Trust boundary*); a final report is
   compared with the caps but not audited.
-- **SIGKILL of the leash cannot be handled** (no receipt). On Linux the
-  agent is asked to die with it, but only the agent itself, not what it
-  spawned; macOS has no equivalent; Windows relies on the Job Object.
+- **SIGKILL of the leash cannot be handled** (no receipt). The sentinel
+  (see *Killing the tree*) ends the whole tree on Linux, in about a second;
+  macOS gets its group kill only (not run there); Windows relies on the Job
+  Object.
 - **A reader of our stdout that stops reading, or cannot keep up with a
   burst,** costs the echo, not the caps: lines are dropped (and counted)
   once 4 MB are queued, and the leash stops waiting for that reader two

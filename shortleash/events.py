@@ -96,7 +96,7 @@ def _spawn_blocks(message: dict) -> list[str]:
     return ids
 
 
-def _tool_calls(message: dict) -> list[tuple[str, str]]:
+def _tool_calls(message: dict, fuzzy: bool = False) -> list[tuple[str, str]]:
     """(block id, fingerprint) of every tool_use block in a message, in
     order. The fingerprint is the tool's name and its input (see
     loops.fingerprint); loop detection compares them. A block without an
@@ -106,11 +106,11 @@ def _tool_calls(message: dict) -> list[tuple[str, str]]:
         if isinstance(block, dict) and block.get("type") == "tool_use":
             out.append((str(block.get("id") or f"<no-id>#{i}"),
                         loops.fingerprint(block.get("name"),
-                                          block.get("input"))))
+                                          block.get("input"), fuzzy)))
     return out
 
 
-def _tool_results(message: dict) -> list[tuple[str, str]]:
+def _tool_results(message: dict, fuzzy: bool = False) -> list[tuple[str, str]]:
     """(tool_use_id, result digest) of every tool_result block in a user
     message (the result of a call, for loop detection)."""
     out: list[tuple[str, str]] = []
@@ -122,7 +122,21 @@ def _tool_results(message: dict) -> list[tuple[str, str]]:
                 and block.get("tool_use_id")):
             out.append((str(block["tool_use_id"]),
                         loops.result_digest(block.get("content"),
-                                            block.get("is_error"))))
+                                            block.get("is_error"), fuzzy)))
+    return out
+
+
+def _tool_result_errors(message: dict) -> list[bool]:
+    """For every tool_result block of a user message, in order: did the
+    tool report an error (``is_error``)? Same blocks as _tool_results."""
+    out: list[bool] = []
+    content = (message or {}).get("content")
+    if not isinstance(content, list):
+        return out
+    for block in content:
+        if (isinstance(block, dict) and block.get("type") == "tool_result"
+                and block.get("tool_use_id")):
+            out.append(block.get("is_error") is True)
     return out
 
 
@@ -131,7 +145,7 @@ def _count_spawns(message: dict) -> int:
     return len(_spawn_blocks(message))
 
 
-def parse_line(line: str) -> dict | None:
+def parse_line(line: str, fuzzy: bool = False) -> dict | None:
     """Parse one stdout line. Returns an observation dict or None to ignore."""
     line = line.strip()
     if not line or not line.startswith("{"):
@@ -165,15 +179,17 @@ def parse_line(line: str) -> dict | None:
             # The model that produced THIS message (a subagent may run on
             # another one than the session's): "" when the event names none.
             "model": str(message.get("model") or ""),
-            "tool_calls": _tool_calls(message),
+            "tool_calls": _tool_calls(message, fuzzy),
         }
 
     if etype == "user":
         message = ev.get("message")
-        results = _tool_results(message) if isinstance(message, dict) else []
+        results = (_tool_results(message, fuzzy)
+                   if isinstance(message, dict) else [])
         if not results:
             return None
-        return {"kind": "tool_results", "results": results}
+        return {"kind": "tool_results", "results": results,
+                "errors": _tool_result_errors(message)}
 
     if etype == "result":
         text = ev.get("result")

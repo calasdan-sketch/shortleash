@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 
 #: Longest repeating block looked for (A, AB, ABC, ABCD).
 MAX_PERIOD = 4
@@ -51,38 +52,65 @@ POLLING_TOOLS = frozenset({
 })
 
 
-def _normalise(obj, depth: int = 0):
-    """Trailing white space off every string (keys kept as they are)."""
+#: Volatile tokens that make two identical results look different: masked
+#: in --loop-fuzzy mode (results keep every other digit, so "5 failed" then
+#: "4 failed" is still progress, never a repeat).
+_VOLATILE = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?"
+    r"|\b\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\b"
+    r"|\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{12}\b"
+    r"|\b[0-9a-fA-F]{8,}\b"
+    r"|\b\d+(?:\.\d+)?\s?(?:ms|secs?|seconds?|minutes?|min|s)\b"
+    r"|\b[Pp][Ii][Dd][ =:]*\d+")
+_DIGITS = re.compile(r"\d+")
+_SPACE = re.compile(r"\s+")
+
+
+def _normalise(obj, depth: int = 0, mode: str | None = None):
+    """Trailing white space off every string (keys kept as they are).
+    ``mode`` "input" (fuzzy): also white space runs collapsed and every run
+    of digits masked; "result" (fuzzy): volatile tokens masked."""
     if depth > 200:
         raise RecursionError("too deep")
     if isinstance(obj, str):
-        return "\n".join(line.rstrip() for line in obj.rstrip().split("\n"))
+        out = "\n".join(line.rstrip() for line in obj.rstrip().split("\n"))
+        if mode == "input":
+            out = _DIGITS.sub("0", _VOLATILE.sub("~", _SPACE.sub(" ", out)))
+        elif mode == "result":
+            out = _VOLATILE.sub("~", out)
+        return out
     if isinstance(obj, dict):
-        return {k: _normalise(v, depth + 1) for k, v in obj.items()}
+        return {k: _normalise(v, depth + 1, mode) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return [_normalise(v, depth + 1) for v in obj]
+        return [_normalise(v, depth + 1, mode) for v in obj]
     return obj
 
 
-def _digest(obj) -> str:
+def _digest(obj, mode: str | None = None) -> str:
     try:
-        canon = json.dumps(_normalise(obj), sort_keys=True, ensure_ascii=False,
-                           separators=(",", ":"), default=str)
+        canon = json.dumps(_normalise(obj, 0, mode), sort_keys=True,
+                           ensure_ascii=False, separators=(",", ":"),
+                           default=str)
     except (TypeError, ValueError, RecursionError):
         canon = repr(type(obj))
     return hashlib.sha256(canon.encode("utf-8", "replace")).hexdigest()[:8]
 
 
-def fingerprint(name, tool_input) -> str:
+def fingerprint(name, tool_input, fuzzy: bool = False) -> str:
     """'<name>#<hash>' for a tool call: equal for the same tool called with
-    the same input, whatever the key order. Never raises."""
+    the same input, whatever the key order. Never raises. ``fuzzy`` (see
+    --loop-fuzzy) also ignores white space runs and numbers, so a retry that
+    differs only by a timestamp, a port or a shifted line range matches."""
     name = str(name or "?")[:80]
-    return f"{name}#{_digest(tool_input)}"
+    return f"{name}#{_digest(tool_input, 'input' if fuzzy else None)}"
 
 
-def result_digest(content, is_error=False) -> str:
-    """A short hash of a tool_result's content (and whether it failed)."""
-    return _digest([bool(is_error), content])
+def result_digest(content, is_error=False, fuzzy: bool = False) -> str:
+    """A short hash of a tool_result's content (and whether it failed).
+    ``fuzzy``: timestamps, ids, durations and pids in it are ignored."""
+    return _digest([bool(is_error), content], "result" if fuzzy else None)
 
 
 def tool_name(fp: str) -> str:

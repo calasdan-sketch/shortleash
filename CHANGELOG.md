@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.3.0 — unreleased
+
+Found by putting the tool in front of FinOps, process-supervision, reliability
+and agent-safety testers (and a first-time user reading only the README); the
+numbers are from `bench/` and can be re-run.
+
+New:
+- **Fast hook.** The hook keeps the state after the bytes it has read of each
+  transcript (`<state>/hook-cache/`) and reads only what was appended. On a
+  synthetic 151 MB / 101-transcript session a call went from 2714 ms to
+  165 ms (40 MB: 733 ms to 115 ms). Same figures as a full read (tested by
+  replaying random growth); a stale, corrupt or replaced cache is dropped.
+  `SHORTLEASH_NO_CACHE=1` switches it off. A transcript line over 32 MB is
+  skipped, not held in memory.
+- **Spend ledger and machine-wide caps:** `--daily-budget USD` and
+  `--project-daily-budget USD` for `run` and `hook`, over every run and
+  session on the machine for the local day. One append-only file per run /
+  session, no locks, no lost writes under concurrency (tested with 6
+  processes). Unusable ledger: `run` exits `2` before starting, the hook
+  fails per `--fail-closed`. Receipts carry `ledger`.
+- **Tamper-evident receipts:** `run --chain PATH` appends each receipt to a
+  hash-chained JSON-lines log; `shortleash verify PATH` names the first
+  edited, removed, inserted or moved record. Optional HMAC
+  (`--chain-key-env` / `SHORTLEASH_CHAIN_KEY`) and `--expect-head` to notice
+  cut-off records. Exclusive lock for concurrent runs.
+- **`hook install --block-prompts`:** also registers the hook on
+  `UserPromptSubmit`, so a session over its budget cannot take another
+  prompt (a talking-only turn never reaches `PreToolUse`). The prompt is
+  never logged.
+- **`--loop-fuzzy`:** loop matching that ignores white space and numbers in
+  inputs and timestamps, UUIDs, hex ids, durations and pids in results.
+  `--max-errors N`: stop after N tool calls in a row failed (`run` and
+  `hook`). On the bundled synthetic corpus: 1 of 8 stuck traces caught
+  before, 6 with fuzzy, 8 with both; one false positive (a seed sweep).
+- **Processes that leave the group (Linux):** at a kill the leash also kills
+  the agent's descendants that called `setsid()` (found through `/proc`, by
+  pid and start time), is a child subreaper so orphans below the agent are
+  swept, and runs a **sentinel** that kills the agent's group and every
+  tracked descendant if the leash itself dies without a goodbye (`kill -9`,
+  the OOM killer). Survivors out of 3 left-behind sleepers: `kill -9` 3 to 0,
+  breach 1 to 2 to 0, SIGTERM 1 to 2 to 0. `SHORTLEASH_NO_ESCAPE_SWEEP=1`
+  switches it off.
+- `bench/bench_hook.py`, `bench/bench_orphans.py`, `bench/bench_loops.py`;
+  `sim/orphans.py`.
+
+Changed:
+- Comparison table in the README rebuilt (Anthropic spend limits, ccusage,
+  LiteLLM, AgentBudget) with sources, and a *Benchmarks* section.
+- `events.parse_line`, `loops.fingerprint` and `loops.result_digest` take an
+  optional `fuzzy` flag; tool-result observations carry `errors`.
+  Receipts have a new `ledger` field (null unless a daily cap was set).
+  Everything else is backward compatible.
+
+Known limits, stated in the README: the estimate can sit about 11% under what
+Claude Code records itself on a subagent-heavy session (the hook enforces
+the larger of the two when `cost-state` is present); a daemon double-forked
+less than a second before a `kill -9` can still escape; fuzzy matching and
+`--max-errors` trade some false positives for recall; nothing new was run on
+macOS or Windows; `UserPromptSubmit` blocking was not tried in a live Claude
+Code.
+
 ## 0.2.0 — unreleased
 
 New:

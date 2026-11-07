@@ -21,9 +21,11 @@ import os
 import sys
 
 from . import cacheopt
+from . import chain as chain_mod
 from . import fleet as fleet_mod
 from . import guard as guard_mod
 from . import hook as hook_mod
+from . import ledger as ledger_mod
 from . import pricing
 from . import __version__
 
@@ -66,6 +68,24 @@ def _add_run_parser(sub) -> None:
                         "(same tool, same input) -- or the same cycle of up "
                         "to 3 calls -- is repeated N times in a row "
                         "(N >= 2).")
+    r.add_argument("--max-errors", type=int, default=None, metavar="N",
+                   help="Stop the run after N tool calls in a row FAILED "
+                        "(is_error): an agent that varies its commands is "
+                        "not repeating itself, but it is not getting "
+                        "anywhere (N >= 2). Needs per-message events.")
+    r.add_argument("--loop-fuzzy", action="store_true",
+                   help="Loop detection also ignores white space and "
+                        "numbers in a call's input and timestamps, ids and "
+                        "durations in its result.")
+    r.add_argument("--daily-budget", type=float, default=None, metavar="USD",
+                   help="Stop the run when ALL runs and hook sessions on "
+                        "this machine have spent more than this today "
+                        "(local day), from the shared spend ledger.")
+    r.add_argument("--project-daily-budget", type=float, default=None,
+                   metavar="USD",
+                   help="Like --daily-budget, counting only runs started in "
+                        "this directory (and hook sessions of this "
+                        "project).")
     r.add_argument("--idle-timeout", type=float, default=None,
                    metavar="SECONDS",
                    help="Stuck cap: kill the run when the agent prints "
@@ -100,6 +120,13 @@ def _add_run_parser(sub) -> None:
                    help="Append the receipt as Markdown to this file, e.g. "
                         "\"$GITHUB_STEP_SUMMARY\" for a GitHub Actions job "
                         "summary. The command and prompt are left out.")
+    r.add_argument("--chain", type=str, default=None, metavar="PATH",
+                   help="Append the receipt to a tamper-evident hash chain "
+                        "(JSON lines); check it with `shortleash verify`.")
+    r.add_argument("--chain-key-env", type=str, default=None, metavar="VAR",
+                   help="Name of the environment variable holding a secret "
+                        "that also signs each chained record (HMAC-SHA256). "
+                        "Default: SHORTLEASH_CHAIN_KEY when it is set.")
     r.add_argument("--redact-prompt", action="store_true",
                    help="Replace the prompt (the argument after -p/--print/"
                         "--prompt) with <redacted> in the receipt. Prompts "
@@ -184,6 +211,30 @@ def _add_hook_caps(p) -> None:
     p.add_argument("--max-repeats", type=int, default=None, metavar="N",
                    help="Deny a tool call that would repeat the same call (or "
                         "cycle of up to 3) N times in a row (N >= 2).")
+    p.add_argument("--max-errors", type=int, default=None, metavar="N",
+                   help="Deny a tool call after N tool calls in a row "
+                        "FAILED (is_error) -- a stuck agent that varies its "
+                        "commands is not a repeat, but it is not getting "
+                        "anywhere (N >= 2).")
+    p.add_argument("--loop-fuzzy", action="store_true",
+                   help="Loop detection also ignores white space and "
+                        "numbers in a call's input and timestamps, ids and "
+                        "durations in its result, so a retry that differs "
+                        "only by a timestamp still counts as a repeat.")
+    p.add_argument("--daily-budget", type=float, default=None, metavar="USD",
+                   help="Hard cap on the USD spent today (local day) by ALL "
+                        "sessions and runs on this machine that use the "
+                        "ledger.")
+    p.add_argument("--project-daily-budget", type=float, default=None,
+                   metavar="USD",
+                   help="Hard cap on the USD spent today in this project "
+                        "(the directory Claude Code keeps its transcripts "
+                        "in).")
+    p.add_argument("--block-prompts", action="store_true",
+                   help="With `install`: also register the hook on "
+                        "UserPromptSubmit, so a session over its caps "
+                        "cannot take another prompt (a turn without tool "
+                        "calls never reaches PreToolUse).")
     p.add_argument("--pricing", type=str, default=None,
                    help="JSON file overriding the fallback pricing table.")
     p.add_argument("--fail-closed", action="store_true",
@@ -205,6 +256,19 @@ def _add_hook_parser(sub) -> None:
                    help="Merge the hook into this settings file (e.g. "
                         ".claude/settings.json); the old file is kept as "
                         ".bak.")
+
+
+def _add_verify_parser(sub) -> None:
+    v = sub.add_parser("verify", help="Check a receipt chain written by "
+                                      "`run --chain`.")
+    v.add_argument("path", help="The chain file.")
+    v.add_argument("--key-env", type=str, default=None, metavar="VAR",
+                   help="Environment variable holding the secret the chain "
+                        "was signed with (default SHORTLEASH_CHAIN_KEY when "
+                        "set); every record's MAC must then check out.")
+    v.add_argument("--expect-head", type=str, default=None, metavar="HASH",
+                   help="The head hash you wrote down: fails when the chain "
+                        "ends anywhere else (records cut off the end).")
 
 
 def _add_cache_parser(sub) -> None:
@@ -241,6 +305,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_run_parser(sub)
     _add_fleet_parser(sub)
     _add_hook_parser(sub)
+    _add_verify_parser(sub)
     _add_cache_parser(sub)
     return p
 
@@ -360,6 +425,12 @@ def _check_hook_caps(parser, args) -> None:
             parser.error(f"{flag} must be >= 0 (got {value})")
     if args.max_repeats is not None and args.max_repeats < 2:
         parser.error(f"--max-repeats must be >= 2 (got {args.max_repeats})")
+    if args.max_errors is not None and args.max_errors < 2:
+        parser.error(f"--max-errors must be >= 2 (got {args.max_errors})")
+    for flag, value in (("--daily-budget", args.daily_budget),
+                        ("--project-daily-budget", args.project_daily_budget)):
+        if value is not None and not (math.isfinite(value) and value >= 0):
+            parser.error(f"{flag} must be a finite number >= 0 (got {value:g})")
     if (args.ask_over is not None and args.budget is not None
             and args.ask_over >= args.budget):
         parser.error(f"--ask-over (${args.ask_over:g}) must be below "
@@ -367,11 +438,50 @@ def _check_hook_caps(parser, args) -> None:
                      f"call is denied, so there is nothing left to approve")
 
 
+CHAIN_KEY_ENV = "SHORTLEASH_CHAIN_KEY"
+
+
+def _chain_key(var: str | None) -> tuple[bytes | None, str | None]:
+    """(key bytes or None, error text or None). An explicitly named variable
+    that is unset or empty is an error; the default one is optional."""
+    name = var or CHAIN_KEY_ENV
+    value = os.environ.get(name)
+    if value:
+        return value.encode("utf-8"), None
+    if var:
+        return None, f"environment variable {var} is not set or is empty"
+    return None, None
+
+
+def _cmd_verify(args) -> int:
+    key, err = _chain_key(args.key_env)
+    if err:
+        print(f"shortleash: error: {err}", file=sys.stderr)
+        return 2
+    res = chain_mod.verify(args.path, key, args.expect_head)
+    if res["ok"]:
+        print(f"OK: {res['records']} record(s), head {res['head']}"
+              + (f", {res['mac_checked']} MAC(s) checked" if key
+                 else "; no key given, so only the hash chain was checked"))
+        print("Write the head down somewhere the log's writer cannot reach "
+              "and pass it as --expect-head next time to notice cut-off "
+              "records.")
+        return 0
+    print(f"BROKEN: {len(res['problems'])} problem(s) in {args.path}",
+          file=sys.stderr)
+    for problem in res["problems"][:20]:
+        print(f"  {problem}", file=sys.stderr)
+    return 1
+
+
 def _cmd_hook_install(args) -> int:
     if all(v is None for v in (args.budget, args.ask_over, args.max_tokens,
-                               args.max_spawns, args.max_repeats)):
+                               args.max_spawns, args.max_repeats,
+                               args.max_errors, args.daily_budget,
+                               args.project_daily_budget)):
         print("shortleash: error: give at least one cap (--budget, "
-              "--ask-over, --max-tokens, --max-spawns, --max-repeats)",
+              "--ask-over, --max-tokens, --max-spawns, --max-repeats, "
+              "--max-errors, --daily-budget, --project-daily-budget)",
               file=sys.stderr)
         return 2
     if args.pricing:
@@ -385,7 +495,8 @@ def _cmd_hook_install(args) -> int:
     if args.write:
         try:
             backup = hook_mod.write_settings(args.write, command,
-                                             args.fail_closed)
+                                             args.fail_closed,
+                                             args.block_prompts)
         except (OSError, ValueError) as e:
             print(f"shortleash: error: {e}", file=sys.stderr)
             return 2
@@ -397,8 +508,8 @@ def _cmd_hook_install(args) -> int:
     print("# Add this to .claude/settings.json (project) or "
           "~/.claude/settings.json (all projects),")
     print("# or run this command again with --write .claude/settings.json")
-    print(json.dumps(hook_mod.settings_block(command, args.fail_closed),
-                     indent=2))
+    print(json.dumps(hook_mod.settings_block(command, args.fail_closed,
+                                       args.block_prompts), indent=2))
     return 0
 
 
@@ -423,6 +534,12 @@ def _caps_banner(args) -> str:
         caps.append(f"idle_timeout={args.idle_timeout:g}s")
     if args.ask_over is not None:
         caps.append(f"ask_over=${args.ask_over:g}")
+    if args.max_errors is not None:
+        caps.append(f"max_errors={args.max_errors}")
+    if args.daily_budget is not None:
+        caps.append(f"daily_budget=${args.daily_budget:g}")
+    if args.project_daily_budget is not None:
+        caps.append(f"project_daily_budget=${args.project_daily_budget:g}")
     if args.anomaly is not None:
         caps.append(f"anomaly={args.anomaly:g}x (needs {args.min_history} runs)")
     return " ".join(caps) if caps else "no caps set (nothing will be enforced)"
@@ -493,6 +610,8 @@ def main(argv: list[str] | None = None) -> int:
         return hook_mod.run_hook(args)
     if args.cmd == "fleet":
         return _print_command(_cmd_fleet, args)
+    if args.cmd == "verify":
+        return _print_command(_cmd_verify, args)
     if args.cmd == "run":
         # A cap that is NaN or infinite compares False with everything: it
         # would never trip, yet the banner and the receipt would list it as
@@ -503,6 +622,9 @@ def main(argv: list[str] | None = None) -> int:
                             ("--idle-timeout", args.idle_timeout),
                             ("--ask-over", args.ask_over),
                             ("--ask-timeout", args.ask_timeout),
+                            ("--daily-budget", args.daily_budget),
+                            ("--project-daily-budget",
+                             args.project_daily_budget),
                             ("--anomaly", args.anomaly)):
             if value is not None and not math.isfinite(value):
                 parser.error(f"{flag} must be a finite number (got {value:g})")
@@ -530,6 +652,23 @@ def main(argv: list[str] | None = None) -> int:
         if args.idle_timeout is not None and args.idle_timeout <= 0:
             parser.error(f"--idle-timeout must be > 0 seconds "
                          f"(got {args.idle_timeout:g})")
+        for flag, value in (("--daily-budget", args.daily_budget),
+                            ("--project-daily-budget",
+                             args.project_daily_budget)):
+            if value is not None and value < 0:
+                parser.error(f"{flag} must be >= 0 (got {value:g})")
+        if args.max_errors is not None and args.max_errors < 2:
+            parser.error(f"--max-errors must be >= 2 (got {args.max_errors})")
+        if (args.daily_budget is not None
+                or args.project_daily_budget is not None):
+            # fail closed on setup: a cap that cannot be checked must not
+            # be listed as enforced (same rule as an unwritable --receipt)
+            problem = ledger_mod.check_writable()
+            if problem:
+                print(f"shortleash: error: the spend ledger cannot be "
+                      f"used ({problem}); --daily-budget / "
+                      f"--project-daily-budget need it", file=sys.stderr)
+                return 2
         # One call is no loop: a cap of 1 would stop every run at its
         # first repeated read.
         if args.max_repeats is not None and args.max_repeats < 2:
@@ -566,7 +705,14 @@ def main(argv: list[str] | None = None) -> int:
                   f"{e}", file=sys.stderr)
             return 2
 
+        chain_key = None
+        if args.chain:
+            chain_key, err = _chain_key(args.chain_key_env)
+            if err:
+                print(f"shortleash: error: {err}", file=sys.stderr)
+                return 2
         g = guard_mod.Guard(
+            chain_path=args.chain, chain_key=chain_key,
             budget=args.budget,
             max_spawns=args.max_spawns,
             max_tokens=args.max_tokens,
@@ -587,6 +733,11 @@ def main(argv: list[str] | None = None) -> int:
             receipt_md=args.receipt_md,
             ask_over=args.ask_over,
             ask_timeout=args.ask_timeout,
+            daily_budget=args.daily_budget,
+            project_daily_budget=args.project_daily_budget,
+            max_errors=args.max_errors,
+            loop_fuzzy=args.loop_fuzzy,
+            ledger_project=ledger_mod.project_of_dir(os.getcwd()),
         )
         if not args.quiet:
             # Never echo the full argv: it may contain secrets. Show only

@@ -170,6 +170,7 @@ def build_receipt(
     models: dict | None = None,
     budget: float | None = None,
     approval: dict | None = None,
+    ledger_info: dict | None = None,
 ) -> dict:
     warnings = list(warnings or [])
     if cost_usd is not None and not math.isfinite(cost_usd):
@@ -219,6 +220,9 @@ def build_receipt(
         # --ask-over: {"threshold_usd", "cost_at_ask_usd", "answer",
         # "waited_s"} once the gate was reached, else None.
         "approval": approval,
+        # --daily-budget / --project-daily-budget: what the machine had
+        # spent today (this run included) when the run ended, else None.
+        "ledger": ledger_info,
         "subagent_spawns": spawns,
         "exit_code": exit_code,
         # What the child itself returned, untouched: a negative "killed by
@@ -310,6 +314,16 @@ def format_human(receipt: dict) -> str:
         lines.append(f"  approval:  asked at ${approval['cost_at_ask_usd']:.4f} "
                      f"(threshold ${approval['threshold_usd']:g}): "
                      f"{approval['answer']} after {approval['waited_s']}s")
+    led = receipt.get("ledger")
+    if led:
+        bits = []
+        if led.get("daily_budget_usd") is not None:
+            bits.append(f"today ${led['day_spend_usd']:.4f} of "
+                        f"${led['daily_budget_usd']:g}")
+        if led.get("project_daily_budget_usd") is not None:
+            bits.append(f"project today ${led['project_spend_usd']:.4f} of "
+                        f"${led['project_daily_budget_usd']:g}")
+        lines.append("  ledger:    " + ", ".join(bits))
     models = receipt.get("models") or {}
     if len(models) > 1:
         lines.append("  models:    " + ", ".join(

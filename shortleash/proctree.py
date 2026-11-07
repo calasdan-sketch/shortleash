@@ -151,6 +151,360 @@ def _kill_tree_windows(pid: int, child_exited: bool) -> int:
     return killed
 
 
+# -- processes that left the group (Linux) ---------------------------------
+#
+# A process group is not a container: a grandchild that calls setsid() (a
+# daemon, `nohup setsid`, a tool that detaches on purpose) leaves it and a
+# group kill never reaches it. On Linux the leash can still find it by
+# ancestry: it reads /proc, remembers who descends from the agent while they
+# are descended from it, and, being a "child subreaper" (PR_SET_CHILD_
+# SUBREAPER), becomes the parent of anything orphaned below the agent
+# instead of init, so those stay findable after their parent is killed.
+# Elsewhere (macOS, Windows -- where the Job Object already covers it) all
+# of this does nothing.
+
+#: Set to any value to switch off the sentinel and the by-ancestry sweep
+#: (the benchmarks use it to measure what they add).
+NO_ESCAPE_ENV = "SHORTLEASH_NO_ESCAPE_SWEEP"
+_PR_SET_CHILD_SUBREAPER = 36
+_subreaper = False
+#: How many detached processes the last kill_tree() found and killed.
+detached_killed = 0
+
+
+def _linux() -> bool:
+    return sys.platform.startswith("linux") and os.path.isdir("/proc/self")
+
+
+_baseline_children: "set[int]" = set()
+
+
+def _prctl_subreaper(flag: int) -> bool:
+    import ctypes
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+                      ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    return prctl(_PR_SET_CHILD_SUBREAPER, flag, 0, 0, 0) == 0
+
+
+def set_subreaper() -> bool:
+    """Make the leash the adoptive parent of orphans below the agent
+    (Linux, best effort). True when it took effect. The children the
+    process already has are remembered and never swept."""
+    global _subreaper, _baseline_children
+    if not _linux() or os.environ.get(NO_ESCAPE_ENV):
+        return False
+    try:
+        table = process_table()
+        me = os.getpid()
+        _baseline_children = {p for p, v in table.items() if v[0] == me}
+        _subreaper = _prctl_subreaper(1)
+    except Exception:
+        _subreaper = False
+    return _subreaper
+
+
+#: The agent the current run is guarding: only a kill aimed at THIS agent
+#: sweeps what the leash adopted (a late kill meant for an earlier run in the
+#: same process must never touch the current run's processes).
+_agent_pid: "int | None" = None
+
+
+def note_agent(pid: int) -> None:
+    global _agent_pid
+    _agent_pid = pid
+
+
+def clear_subreaper() -> None:
+    global _subreaper, _agent_pid
+    if _subreaper:
+        reap_adopted_zombies(protected | ({_agent_pid} if _agent_pid else set()))
+    _agent_pid = None
+    if _subreaper:
+        try:
+            _prctl_subreaper(0)
+        except Exception:
+            pass
+    _subreaper = False
+
+
+def process_table() -> dict:
+    """{pid: (ppid, pgrp, sid, starttime, state)} read from /proc (Linux); {} when
+    that is not possible. Start time makes (pid, start) an identity that a
+    recycled pid does not share."""
+    table: dict = {}
+    if not _linux():
+        return table
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return table
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as f:
+                raw = f.read().decode("utf-8", "replace")
+            rest = raw[raw.rindex(")") + 2:].split()
+            table[int(name)] = (int(rest[1]), int(rest[2]), int(rest[3]),
+                                int(rest[19]), rest[0])
+        except (OSError, ValueError, IndexError):
+            continue  # gone, or unreadable
+    return table
+
+
+def descendants(root: int, table: dict) -> dict:
+    """{pid: starttime} of every process below ``root`` by ancestry."""
+    kids: dict = {}
+    for pid, (ppid, _pg, _sid, _st, _state) in table.items():
+        kids.setdefault(ppid, []).append(pid)
+    out: dict = {}
+    stack = list(kids.get(root, []))
+    while stack:
+        pid = stack.pop()
+        if pid in out or pid not in table:
+            continue
+        out[pid] = table[pid][3]
+        stack.extend(kids.get(pid, []))
+    return out
+
+
+def _kill_identified(victims: dict) -> int:
+    """SIGKILL each (pid -> starttime) that is still the same process."""
+    now = process_table()
+    n = 0
+    for pid, st in victims.items():
+        if pid in now and now[pid][3] == st and pid != os.getpid():
+            try:
+                os.kill(pid, signal.SIGKILL)
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
+def reap_adopted_zombies(exclude: "set[int]") -> None:
+    """Collect the zombies of adopted orphans that died (we became their
+    parent when the agent went; nobody else will wait for them)."""
+    if not _subreaper:
+        return
+    me = os.getpid()
+    for pid, v in process_table().items():
+        if (v[0] == me and v[4] == "Z" and pid not in exclude
+                and pid not in _baseline_children):
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except OSError:
+                pass
+
+
+def escaped_below(agent_pid: int) -> dict:
+    """{pid: starttime} of the agent's descendants that are NOT in its
+    process group (detached with setsid) right now."""
+    table = process_table()
+    return {pid: st for pid, st in descendants(agent_pid, table).items()
+            if table[pid][1] != agent_pid}
+
+
+def sweep_adopted(exclude: "set[int]") -> int:
+    """Kill what the leash adopted and its subtrees (orphans of the agent;
+    needs set_subreaper). ``exclude``: pids that are ours to keep."""
+    if not _subreaper:
+        return 0
+    me = os.getpid()
+    table = process_table()
+    victims: dict = {}
+    for pid, (ppid, _pg, _sid, st, _state) in table.items():
+        if ppid == me and pid not in exclude and pid not in _baseline_children:
+            victims[pid] = st
+            victims.update(descendants(pid, table))
+    n = _kill_identified(victims)
+    if n:
+        time.sleep(0.05)
+    reap_adopted_zombies(exclude)
+    return n
+
+
+# -- the sentinel: the tree dies with the leash, even on kill -9 -----------
+#
+# PR_SET_PDEATHSIG (see parent_death_kwargs) takes only the agent itself. A
+# second small process, started in its own session, holds the read end of a
+# pipe whose write end only the leash has. When the leash ends without saying
+# it is done -- kill -9, the OOM killer, a crash -- the pipe closes, and the
+# sentinel SIGKILLs the agent's process group and every descendant it has
+# been tracking (once a second, by ancestry and start time, so a setsid'd
+# daemon is included on Linux). On a normal finish the leash writes "d" and
+# the sentinel exits without touching anything.
+
+_SENTINEL_CODE = r"""
+import os, select, signal, sys
+leash = int(sys.argv[1])
+for _s in (signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
+    try:
+        signal.signal(_s, signal.SIG_IGN)
+    except Exception:
+        pass
+
+def table():
+    t = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return t
+    for n in names:
+        if n.isdigit():
+            try:
+                raw = open("/proc/%s/stat" % n, "rb").read().decode("utf-8", "replace")
+                r = raw[raw.rindex(")") + 2:].split()
+                t[int(n)] = (int(r[1]), int(r[2]), int(r[19]))
+            except Exception:
+                pass
+    return t
+
+# The leash starts us BEFORE the agent (starting a process takes a few ms
+# the agent's first lines should not wait for) and then writes "p<pid>\n".
+buf = b""
+while b"\n" not in buf:
+    ready, _, _ = select.select([0], [], [], 30.0)
+    if not ready:
+        sys.exit(0)
+    data = os.read(0, 64)
+    if not data:
+        sys.exit(0)        # the leash ended before it launched anything
+    buf += data
+agent = int(buf.split(b"\n", 1)[0].lstrip(b"p"))
+pgid = agent
+rest = buf.split(b"\n", 1)[1]
+if rest.startswith(b"d"):
+    sys.exit(0)
+
+known = {}
+start0 = None
+baseline = None
+
+def refresh():
+    global start0, baseline
+    t = table()
+    if start0 is None and agent in t:
+        start0 = t[agent][2]
+    kids = {}
+    for pid, (pp, pg, st) in t.items():
+        kids.setdefault(pp, []).append(pid)
+    if baseline is None:
+        # the leash's children from before the agent started (passed in)
+        baseline = set(int(x) for x in sys.argv[2].split(",") if x)
+        baseline.add(os.getpid())
+        baseline.discard(agent)
+    # the agent, and what the leash adopted when the agent's orphans lost
+    # their parent (it is a child subreaper on Linux)
+    stack = [agent] + [p for p in kids.get(leash, []) if p not in baseline]
+    while stack:
+        p = stack.pop()
+        if p in t:
+            known[p] = t[p][2]
+            stack.extend(kids.get(p, []))
+    for pid, (pp, pg, st) in t.items():
+        if pg == pgid and (start0 is None or st >= start0):
+            known[pid] = st
+
+refresh()
+while True:
+    try:
+        ready, _, _ = select.select([0], [], [], 1.0)
+    except InterruptedError:
+        continue
+    if ready:
+        data = os.read(0, 16)
+        if data.startswith(b"d"):
+            sys.exit(0)
+        if not data:
+            break
+        continue
+    refresh()
+refresh()
+t = table()
+for pid, st in known.items():
+    if pid in t and t[pid][2] == st and pid != os.getpid():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+try:
+    os.killpg(pgid, signal.SIGKILL)
+except Exception:
+    pass
+"""
+
+
+class Sentinel:
+    def __init__(self, proc: subprocess.Popen, wfd: int):
+        self.proc = proc
+        self.wfd = wfd
+
+    @property
+    def pid(self) -> int:
+        return self.proc.pid
+
+    def attach(self, agent_pid: int) -> None:
+        """Tell the sentinel which process group it is guarding."""
+        try:
+            os.write(self.wfd, b"p%d\n" % agent_pid)
+        except OSError:
+            pass
+
+    def done(self) -> None:
+        """The run ended normally: tell the sentinel to stand down."""
+        try:
+            os.write(self.wfd, b"d")
+        except OSError:
+            pass
+        try:
+            os.close(self.wfd)
+        except OSError:
+            pass
+        deadline = time.monotonic() + 3.0
+        while self.proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if self.proc.poll() is None:
+            try:
+                self.proc.kill()
+                while self.proc.poll() is None:
+                    time.sleep(0.01)
+            except Exception:
+                pass
+        protected.discard(self.proc.pid)
+
+
+def start_sentinel() -> "Sentinel | None":
+    """Start the sentinel (POSIX); ``attach(pid)`` then names the agent whose
+    process group it guards. None on Windows (the kill-on-close Job Object does this) or when
+    it cannot be started: the run is then guarded as before."""
+    if is_windows() or os.environ.get(NO_ESCAPE_ENV):
+        return None
+    try:
+        r, w = os.pipe()
+    except OSError:
+        return None
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-c", _SENTINEL_CODE, str(os.getpid()),
+             ",".join(str(p) for p in sorted(_baseline_children))],
+            stdin=r, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True)
+    except Exception:
+        os.close(r)
+        os.close(w)
+        return None
+    os.close(r)
+    protected.add(proc.pid)
+    return Sentinel(proc, w)
+
+
+#: Pids the leash must never sweep (its own helpers, e.g. the sentinel).
+protected: "set[int]" = set()
+
+
 def _signal_group(pgid: int, sig: int) -> bool:
     try:
         os.killpg(pgid, sig)  # noqa: no-member on Windows; never reached there
@@ -161,6 +515,21 @@ def _signal_group(pgid: int, sig: int) -> bool:
 
 def _kill_tree_posix(proc: subprocess.Popen, grace: float,
                      child_exited: bool) -> int:
+    global detached_killed
+    detached_killed = 0
+    off = bool(os.environ.get(NO_ESCAPE_ENV))
+    detached = {} if child_exited or off else escaped_below(proc.pid)
+    n = _kill_group(proc, grace, child_exited)
+    # Whatever left the group (setsid) is killed by identity, then whatever
+    # that left orphaned and the leash adopted.
+    detached_killed = (_kill_identified(detached) if detached else 0)
+    if proc.pid == _agent_pid:
+        detached_killed += sweep_adopted(protected | {proc.pid})
+    return n + (1 if detached_killed else 0)
+
+
+def _kill_group(proc: subprocess.Popen, grace: float,
+                child_exited: bool) -> int:
     pgid = proc.pid  # start_new_session=True => pgid == pid
     if not _signal_group(pgid, signal.SIGTERM):
         return 0  # group already empty: nothing escaped
